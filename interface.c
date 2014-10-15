@@ -1,20 +1,20 @@
 /*
-    This file is part of telegram-client.
+    This file is part of telegram-cli.
 
-    Telegram-client is free software: you can redistribute it and/or modify
+    Telegram-cli is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation, either version 2 of the License, or
     (at your option) any later version.
 
-    Telegram-client is distributed in the hope that it will be useful,
+    Telegram-cli is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
-    along with this telegram-client.  If not, see <http://www.gnu.org/licenses/>.
+    along with this telegram-cli.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright Vitaly Valtman 2013
+    Copyright Vitaly Valtman 2013-2014
 */
 
 #ifdef HAVE_CONFIG_H
@@ -36,22 +36,53 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 #endif
+#include <unistd.h>
 
 #include "include.h"
-#include "queries.h"
+//#include "queries.h"
 
 #include "interface.h"
 #include "telegram.h"
-#include "structures.h"
 
-#include "mtproto-common.h"
+#ifdef EVENT_V2
+#include <event2/event.h>
+#include <event2/bufferevent.h>
+#include <event2/buffer.h>
+#else
+#include <event.h>
+#include "event-old.h"
+#endif
+//#include "auto/constants.h"
+//#include "tools.h"
+//#include "structures.h"
+
+#ifdef USE_LUA
+#  include "lua-tg.h"
+#endif
+
+//#include "mtproto-common.h"
+
+#include "tgl.h"
+#include "loop.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#ifdef __APPLE__
+#define OPEN_BIN "open %s"
+#else
+#define OPEN_BIN "xdg-open %s"
+#endif
 
 #define ALLOW_MULT 1
 char *default_prompt = "> ";
 
-int unread_messages;
+int disable_auto_accept;
 int msg_num_mode;
+int disable_colors;
 int alert_sound;
+extern int binlog_read;
 
 int safe_quit;
 
@@ -60,187 +91,406 @@ int readline_active;
 
 int log_level;
 
-long long cur_uploading_bytes;
-long long cur_uploaded_bytes;
-long long cur_downloading_bytes;
-long long cur_downloaded_bytes;
-
 char *line_ptr;
-extern peer_t *Peers[];
-extern int peer_num;
 
 int in_chat_mode;
-peer_id_t chat_mode_id;
+tgl_peer_id_t chat_mode_id;
+extern int readline_disabled;
 
+extern int disable_output;
+
+struct in_ev *notify_ev;
+
+extern int usfd;
+extern int sfd;
+extern int use_ids;
 
 int is_same_word (const char *s, size_t l, const char *word) {
   return s && word && strlen (word) == l && !memcmp (s, word, l);
 }
 
-char *next_token (int *l) {
-  while (*line_ptr == ' ') { line_ptr ++; }
-  if (!*line_ptr) { 
-    *l = 0;
-    return 0;
+static void skip_wspc (void) {
+  while (*line_ptr && ((unsigned char)*line_ptr) <= ' ') {
+    line_ptr ++;
   }
-  int neg = 0;
-  char *s = line_ptr;
-  int in_str = 0;
-  while (*line_ptr && (*line_ptr != ' ' || neg || in_str)) {
-/*    if (*line_ptr == '\\') {
-      neg = 1 - neg;
-    } else {
-      if (*line_ptr == '"' && !neg) {
-        in_str = !in_str;
+}
+
+static char *cur_token;
+static int cur_token_len;
+static int cur_token_end_str;
+static int cur_token_quoted;
+
+#define SOCKET_ANSWER_MAX_SIZE (1 << 25)
+static char socket_answer[SOCKET_ANSWER_MAX_SIZE + 1];
+static int socket_answer_pos = -1;
+
+void socket_answer_start (void) {
+  socket_answer_pos = 0;
+}
+
+static void socket_answer_add_printf (const char *format, ...) __attribute__ ((format (printf, 1, 2)));
+void socket_answer_add_printf (const char *format, ...) {
+  if (socket_answer_pos < 0) { return; }
+  va_list ap;
+  va_start (ap, format);
+  socket_answer_pos += vsnprintf (socket_answer + socket_answer_pos, SOCKET_ANSWER_MAX_SIZE - socket_answer_pos, format, ap);
+  va_end (ap);
+  if (socket_answer_pos > SOCKET_ANSWER_MAX_SIZE) { socket_answer_pos = -1; }
+}
+
+void socket_answer_end (struct in_ev *ev) {
+  if (ev->bev && socket_answer_pos > 0) {
+    static char s[100];
+    sprintf (s, "ANSWER %d\n", socket_answer_pos);
+    bufferevent_write (ev->bev, s, strlen (s));
+    bufferevent_write (ev->bev, socket_answer, socket_answer_pos);
+    bufferevent_write (ev->bev, "\n", 1);
+  }
+  socket_answer_pos = -1;
+}
+
+#define mprintf(ev,...) \
+  if (ev) { socket_answer_add_printf (__VA_ARGS__); } \
+  else { printf (__VA_ARGS__); } 
+
+#define mprint_start(ev,...) \
+  if (!ev) { print_start (__VA_ARGS__); } \
+  else { socket_answer_start (); }
+  
+#define mprint_end(ev,...) \
+  if (!ev) { print_end (__VA_ARGS__); } \
+  else { socket_answer_end (ev); }
+
+#define mpush_color(ev,...) \
+  if (!ev) { push_color (__VA_ARGS__); }
+
+#define mpop_color(ev,...) \
+  if (!ev) { pop_color (__VA_ARGS__); }
+
+static void unescape_token (char *start, char *end) {
+  static char cur_token_buff[(1 << 20) + 1];
+  cur_token_len = 0;
+  cur_token = cur_token_buff;
+  while (start < end) {
+    assert (cur_token_len < (1 << 20));
+    switch (*start) {
+    case '\\':
+      start ++;
+      switch (*start) {
+      case 'n':
+        cur_token[cur_token_len ++] = '\n';
+        break;
+      case 'r':
+        cur_token[cur_token_len ++] = '\r';
+        break;
+      case 't':
+        cur_token[cur_token_len ++] = '\t';
+        break;
+      case 'b':
+        cur_token[cur_token_len ++] = '\b';
+        break;
+      case 'a':
+        cur_token[cur_token_len ++] = '\a';
+        break;
+      default:
+        cur_token[cur_token_len ++] = *start;
+        break;
       }
-      neg = 0;
-    }*/
-    line_ptr++;
+      break;
+    default:
+      cur_token[cur_token_len ++] = *start;;
+      break;
+    }
+    start ++;
   }
-  *l = line_ptr - s;
-  return s;
+  cur_token[cur_token_len] = 0;
+}
+
+int force_end_mode;
+static void next_token (void) {
+  skip_wspc ();
+  cur_token_end_str = 0;
+  cur_token_quoted = 0;
+  if (!*line_ptr) {
+    cur_token_len = 0;
+    cur_token_end_str = 1;
+    return;
+  }
+  char c = *line_ptr;
+  char *start = line_ptr;
+  if (c == '"' || c == '\'') {
+    cur_token_quoted = 1;
+    line_ptr ++;
+    int esc = 0;
+    while (*line_ptr && (esc || *line_ptr != c)) {
+      if (*line_ptr == '\\') {
+        esc = 1 - esc;
+      } else {
+        esc = 0;
+      }
+      line_ptr ++;
+    }
+    if (!*line_ptr) {
+      cur_token_len = -2;
+    } else {
+      unescape_token (start + 1, line_ptr);
+      line_ptr ++;
+    }
+  } else {
+    while (*line_ptr && ((unsigned char)*line_ptr) > ' ') {
+      line_ptr ++;
+    }
+    cur_token = start;
+    cur_token_len = line_ptr - start;
+    cur_token_end_str = (!force_end_mode) && (*line_ptr == 0);
+  }
+}
+
+void next_token_end (void) {
+  skip_wspc ();
+  
+  if (*line_ptr && *line_ptr != '"' && *line_ptr != '\'') {
+    cur_token_quoted = 0;
+    cur_token = line_ptr;
+    while (*line_ptr) { line_ptr ++; }
+    cur_token_len = line_ptr - cur_token;
+    while (((unsigned char)cur_token[cur_token_len - 1]) <= ' ' && cur_token_len >= 0) { 
+      cur_token_len --;
+    }
+    assert (cur_token_len > 0);
+    cur_token_end_str = !force_end_mode;
+    return;
+  } else {
+    if (*line_ptr) {
+      next_token ();
+      skip_wspc ();
+      if (*line_ptr) {
+        cur_token_len = -1; 
+      }
+    } else {
+      next_token ();
+    }
+  }
 }
 
 #define NOT_FOUND (int)0x80000000
-peer_id_t PEER_NOT_FOUND = {.id = NOT_FOUND};
+tgl_peer_id_t TGL_PEER_NOT_FOUND = {.id = NOT_FOUND};
 
-long long next_token_int (void) {
-  int l;
-  char *s = next_token (&l);
-  if (!s) { return NOT_FOUND; }
-  char *r;
-  long long x = strtoll (s, &r, 10);
-  if (r == s + l) { 
-    return x;
-  } else {
+long long cur_token_int (void) {
+  if (cur_token_len <= 0) {
     return NOT_FOUND;
+  } else {
+    char c = cur_token[cur_token_len];
+    cur_token[cur_token_len] = 0;
+    char *end = 0;
+    long long x = strtoll (cur_token, &end, 0);
+    cur_token[cur_token_len] = c;
+    if (end != cur_token + cur_token_len) {
+      return NOT_FOUND;
+    } else {
+      return x;
+    }
   }
 }
 
-peer_id_t next_token_user (void) {
-  int l;
-  char *s = next_token (&l);
-  if (!s) { return PEER_NOT_FOUND; }
+double cur_token_double (void) {
+  if (cur_token_len <= 0) {
+    return NOT_FOUND;
+  } else {
+    char c = cur_token[cur_token_len];
+    cur_token[cur_token_len] = 0;
+    char *end = 0;
+    double x = strtod (cur_token, &end);
+    cur_token[cur_token_len] = c;
+    if (end != cur_token + cur_token_len) {
+      return NOT_FOUND;
+    } else {
+      return x;
+    }
+  }
+}
 
+tgl_peer_id_t cur_token_user (void) {
+  if (cur_token_len <= 0) { return TGL_PEER_NOT_FOUND; }
+  int l = cur_token_len;
+  char *s = cur_token;
+
+  char c = cur_token[cur_token_len];
+  cur_token[cur_token_len] = 0;
+
+  if (l >= 8 && !memcmp (s, "user#id", 7)) {
+    s += 7;    
+    l -= 7;
+    int r = atoi (s);
+    cur_token[cur_token_len] = c;
+    if (r >= 0) { return tgl_set_peer_id (TGL_PEER_USER, r); }
+    else { return TGL_PEER_NOT_FOUND; }
+  }
   if (l >= 6 && !memcmp (s, "user#", 5)) {
     s += 5;    
     l -= 5;
     int r = atoi (s);
-    if (r >= 0) { return set_peer_id (PEER_USER, r); }
-    else { return PEER_NOT_FOUND; }
+    cur_token[cur_token_len] = c;
+    if (r >= 0) { return tgl_set_peer_id (TGL_PEER_USER, r); }
+    else { return TGL_PEER_NOT_FOUND; }
   }
 
-  int index = 0;
-  while (index < peer_num && (!is_same_word (s, l, Peers[index]->print_name) || get_peer_type (Peers[index]->id) != PEER_USER)) {
-    index ++;
-  }
-  if (index < peer_num) {
-    return Peers[index]->id;
+  tgl_peer_t *P = tgl_peer_get_by_name (s); 
+  cur_token[cur_token_len] = c;
+  
+  if (P && tgl_get_peer_type (P->id) == TGL_PEER_USER) {
+    return P->id;
   } else {
-    return PEER_NOT_FOUND;
+    return TGL_PEER_NOT_FOUND;
   }
 }
 
-peer_id_t next_token_chat (void) {
-  int l;
-  char *s = next_token (&l);
-  if (!s) { return PEER_NOT_FOUND; }
+tgl_peer_id_t cur_token_chat (void) {
+  if (cur_token_len <= 0) { return TGL_PEER_NOT_FOUND; }
+  int l = cur_token_len;
+  char *s = cur_token;
+
+  char c = cur_token[cur_token_len];
+  cur_token[cur_token_len] = 0;
   
+  if (l >= 8 && !memcmp (s, "chat#id", 7)) {
+    s += 7;    
+    l -= 7;
+    int r = atoi (s);
+    cur_token[cur_token_len] = c;
+    if (r >= 0) { return tgl_set_peer_id (TGL_PEER_CHAT, r); }
+    else { return TGL_PEER_NOT_FOUND; }
+  }
   if (l >= 6 && !memcmp (s, "chat#", 5)) {
     s += 5;    
     l -= 5;
     int r = atoi (s);
-    if (r >= 0) { return set_peer_id (PEER_CHAT, r); }
-    else { return PEER_NOT_FOUND; }
+    cur_token[cur_token_len] = c;
+    if (r >= 0) { return tgl_set_peer_id (TGL_PEER_CHAT, r); }
+    else { return TGL_PEER_NOT_FOUND; }
   }
 
-  int index = 0;
-  while (index < peer_num && (!is_same_word (s, l, Peers[index]->print_name) || get_peer_type (Peers[index]->id) != PEER_CHAT)) {
-    index ++;
-  }
-  if (index < peer_num) {
-    return Peers[index]->id;
-  } else {
-    return PEER_NOT_FOUND;
-  }
-}
-
-peer_id_t next_token_encr_chat (void) {
-  int l;
-  char *s = next_token (&l);
-  if (!s) { return PEER_NOT_FOUND; }
-
-  int index = 0;
-  while (index < peer_num && (!is_same_word (s, l, Peers[index]->print_name) || get_peer_type (Peers[index]->id) != PEER_ENCR_CHAT)) {
-    index ++;
-  }
-  if (index < peer_num) {
-    return Peers[index]->id;
-  } else {
-    return PEER_NOT_FOUND;
-  }
-}
-
-peer_id_t next_token_peer (void) {
-  int l;
-  char *s = next_token (&l);
-  if (!s) { return PEER_NOT_FOUND; }
+  tgl_peer_t *P = tgl_peer_get_by_name (s); 
+  cur_token[cur_token_len] = c;
   
+  if (P && tgl_get_peer_type (P->id) == TGL_PEER_CHAT) {
+    return P->id;
+  } else {
+    return TGL_PEER_NOT_FOUND;
+  }
+}
+
+tgl_peer_id_t cur_token_encr_chat (void) {
+  if (cur_token_len <= 0) { return TGL_PEER_NOT_FOUND; }
+  char *s = cur_token;
+  char c = cur_token[cur_token_len];
+  cur_token[cur_token_len] = 0;
+
+  tgl_peer_t *P = tgl_peer_get_by_name (s); 
+  cur_token[cur_token_len] = c;
+  
+  if (P && tgl_get_peer_type (P->id) == TGL_PEER_ENCR_CHAT) {
+    return P->id;
+  } else {
+    return TGL_PEER_NOT_FOUND;
+  }
+}
+
+tgl_peer_id_t cur_token_peer (void) {
+  if (cur_token_len <= 0) { return TGL_PEER_NOT_FOUND; }
+  int l = cur_token_len;
+  char *s = cur_token;
+  char c = cur_token[cur_token_len];
+  cur_token[cur_token_len] = 0;
+  
+  if (l >= 8 && !memcmp (s, "user#id", 7)) {
+    s += 7;    
+    l -= 7;
+    int r = atoi (s);
+    cur_token[cur_token_len] = c;
+    if (r >= 0) { return tgl_set_peer_id (TGL_PEER_USER, r); }
+    else { return TGL_PEER_NOT_FOUND; }
+  }
+  if (l >= 8 && !memcmp (s, "chat#id", 7)) {
+    s += 7;    
+    l -= 7;
+    int r = atoi (s);
+    cur_token[cur_token_len] = c;
+    if (r >= 0) { return tgl_set_peer_id (TGL_PEER_CHAT, r); }
+    else { return TGL_PEER_NOT_FOUND; }
+  }
   if (l >= 6 && !memcmp (s, "user#", 5)) {
     s += 5;    
     l -= 5;
     int r = atoi (s);
-    if (r >= 0) { return set_peer_id (PEER_USER, r); }
-    else { return PEER_NOT_FOUND; }
+    cur_token[cur_token_len] = c;
+    if (r >= 0) { return tgl_set_peer_id (TGL_PEER_USER, r); }
+    else { return TGL_PEER_NOT_FOUND; }
   }
   if (l >= 6 && !memcmp (s, "chat#", 5)) {
     s += 5;    
     l -= 5;
     int r = atoi (s);
-    if (r >= 0) { return set_peer_id (PEER_CHAT, r); }
-    else { return PEER_NOT_FOUND; }
+    cur_token[cur_token_len] = c;
+    if (r >= 0) { return tgl_set_peer_id (TGL_PEER_CHAT, r); }
+    else { return TGL_PEER_NOT_FOUND; }
   }
-
-  int index = 0;
-  while (index < peer_num && (!is_same_word (s, l, Peers[index]->print_name))) {
-    index ++;
-  }
-  if (index < peer_num) {
-    return Peers[index]->id;
+  
+  tgl_peer_t *P = tgl_peer_get_by_name (s); 
+  cur_token[cur_token_len] = c;
+  
+  if (P) {
+    return P->id;
   } else {
-    return PEER_NOT_FOUND;
+    return TGL_PEER_NOT_FOUND;
   }
+}
+
+static tgl_peer_t *mk_peer (tgl_peer_id_t id) {
+  if (tgl_get_peer_type (id) == NOT_FOUND) { return 0; }
+  tgl_peer_t *P = tgl_peer_get (id);
+  if (!P) {
+    if (tgl_get_peer_type (id) == TGL_PEER_USER) {
+      tgl_insert_empty_user (tgl_get_peer_id (id));
+    }
+    if (tgl_get_peer_type (id) == TGL_PEER_CHAT) {
+      tgl_insert_empty_chat (tgl_get_peer_id (id));
+    }
+    P = tgl_peer_get (id);
+  }
+  return P;
 }
 
 char *get_default_prompt (void) {
   static char buf[1000];
   int l = 0;
   if (in_chat_mode) {
-    peer_t *U = user_chat_get (chat_mode_id);
+    tgl_peer_t *U = tgl_peer_get (chat_mode_id);
     assert (U && U->print_name);
-    l += tsnprintf (buf + l, 999 - l, COLOR_RED "%.*s " COLOR_NORMAL, 100, U->print_name);
+    l += snprintf (buf + l, 999 - l, COLOR_RED "%.*s " COLOR_NORMAL, 100, U->print_name);
   }
-  if (unread_messages || cur_uploading_bytes || cur_downloading_bytes) {
-    l += tsnprintf (buf + l, 999 - l, COLOR_RED "[");
+  if (tgl_state.unread_messages || tgl_state.cur_uploading_bytes || tgl_state.cur_downloading_bytes) {
+    l += snprintf (buf + l, 999 - l, COLOR_RED "[");
     int ok = 0;
-    if (unread_messages) {
-      l += tsnprintf (buf + l, 999 - l, "%d unread", unread_messages);
+    if (tgl_state.unread_messages) {
+      l += snprintf (buf + l, 999 - l, "%d unread", tgl_state.unread_messages);
       ok = 1;
     }
-    if (cur_uploading_bytes) {
+    if (tgl_state.cur_uploading_bytes) {
       if (ok) { *(buf + l) = ' '; l ++; }
       ok = 1;
-      l += tsnprintf (buf + l, 999 - l, "%lld%%Up", 100 * cur_uploaded_bytes / cur_uploading_bytes);
+      l += snprintf (buf + l, 999 - l, "%lld%%Up", 100 * tgl_state.cur_uploaded_bytes / tgl_state.cur_uploading_bytes);
     }
-    if (cur_downloading_bytes) {
+    if (tgl_state.cur_downloading_bytes) {
       if (ok) { *(buf + l) = ' '; l ++; }
       ok = 1;
-      l += tsnprintf (buf + l, 999 - l, "%lld%%Down", 100 * cur_downloaded_bytes / cur_downloading_bytes);
+      l += snprintf (buf + l, 999 - l, "%lld%%Down", 100 * tgl_state.cur_downloaded_bytes / tgl_state.cur_downloading_bytes);
     }
-    l += tsnprintf (buf + l, 999 - l, "]" COLOR_NORMAL);
+    l += snprintf (buf + l, 999 - l, "]" COLOR_NORMAL);
+    l += snprintf (buf + l, 999 - l, "%s", default_prompt);
     return buf;
   } 
-  l += tsnprintf (buf + l, 999 - l, "%s", default_prompt);
+  l += snprintf (buf + l, 999 - l, "%s", default_prompt);
   return buf;
 }
 
@@ -250,10 +500,12 @@ char *complete_none (const char *text UU, int state UU) {
 
 
 void set_prompt (const char *s) {
+  if (readline_disabled) { return; }
   rl_set_prompt (s);
 }
 
 void update_prompt (void) {
+  if (readline_disabled) { return; }
   print_start ();
   set_prompt (get_default_prompt ());
   if (readline_active) {
@@ -275,197 +527,697 @@ char *in_chat_commands[] = {
   0
 };
 
-char *commands[] = {
-  "help",
-  "msg",
-  "contact_list",
-  "stats",
-  "history",
-  "dialog_list",
-  "send_photo",
-  "send_video",
-  "send_text",
-  "chat_info",
-  "user_info",
-  "fwd",
-  "rename_chat",
-  "load_photo",
-  "view_photo",
-  "load_video_thumb",
-  "view_video_thumb",
-  "load_video",
-  "view_video",
-  "add_contact",
-  "rename_contact",
-  "show_license",
-  "search",
-  "mark_read",
-  "visualize_key",
-  "create_secret_chat",
-  "suggested_contacts",
-  "global_search",
-  "chat_add_user",
-  "chat_del_user",
-  "status_online",
-  "status_offline",
-  "contacts_search",
-  "quit",
-  "safe_quit",
-  "send_audio",
-  "load_audio",
-  "view_audio",
-  "send_document",
-  "load_document_thumb",
-  "view_document_thumb",
-  "load_document",
-  "view_document",
-  "set",
-  "chat_with_peer",
-  "delete_msg",
-  "restore_msg",
-  "create_group_chat",
-  0 };
+enum command_argument {
+  ca_none,
+  ca_user,
+  ca_chat,
+  ca_secret_chat,
+  ca_peer,
+  ca_file_name,
+  ca_file_name_end,
+  ca_period,
+  ca_number,
+  ca_double,
+  ca_string_end,
+  ca_string,
+  ca_modifier,
+  ca_command,
+  ca_extf,
 
-int commands_flags[] = {
-  070,
-  072,
-  07,
-  07,
-  072,
-  07,
-  0732,
-  0732,
-  0732,
-  074,
-  071,
-  072,
-  074,
-  07,
-  07,
-  07,
-  07,
-  07,
-  07,
-  07,
-  071,
-  07,
-  072,
-  072,
-  075,
-  071,
-  07,
-  07,
-  0724,
-  0724,
-  07,
-  07,
-  07,
-  07,
-  07,
-  0732,
-  07,
-  07,
-  0732,
-  07,
-  07,
-  07,
-  07,
-  07,
-  072,
-  07,
-  072,
-  07
+
+  ca_optional = 256
+};
+
+struct arg {
+  int flags;
+  struct {
+    tgl_peer_t *P;
+    struct tgl_message *M;
+    char *str;
+    long long num;
+    double dval;
+  };
+};
+
+struct command {
+  char *name;
+  enum command_argument args[10];
+  void (*fun)(int arg_num, struct arg args[], struct in_ev *ev);
+  char *desc;
 };
 
 
+int offline_mode;
+void print_user_list_gw (void *extra, int success, int num, struct tgl_user *UL[]);
+void print_msg_list_gw (void *extra, int success, int num, struct tgl_message *ML[]);
+void print_dialog_list_gw (void *extra, int success, int size, tgl_peer_id_t peers[], int last_msg_id[], int unread_count[]);
+void print_chat_info_gw (void *extra, int success, struct tgl_chat *C);
+void print_user_info_gw (void *extra, int success, struct tgl_user *C);
+void print_filename_gw (void *extra, int success, char *name);
+void open_filename_gw (void *extra, int success, char *name);
+void print_secret_chat_gw (void *extra, int success, struct tgl_secret_chat *E);
+void print_card_gw (void *extra, int success, int size, int *card);
+void print_user_gw (void *extra, int success, struct tgl_user *U);
+void print_msg_gw (void *extra, int success, struct tgl_message *M);
 
-int get_complete_mode (void) {
+struct command commands[];
+void do_help (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (!arg_num);
+  if (ev) { mprint_start (ev); }
+  mpush_color (ev, COLOR_YELLOW);
+  struct command *cmd = commands;
+  while (cmd->name) {
+    mprintf (ev, "%s\n", cmd->desc);
+    cmd ++;
+  }
+  mpop_color (ev);
+  if (ev) { mprint_end (ev); }
+  if (!ev) {
+    fflush (stdout);
+  }
+}
+
+void do_contact_list (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (!arg_num);
+  if (ev) { ev->refcnt ++; }
+  tgl_do_update_contact_list (print_user_list_gw, ev);
+}
+
+void do_stats (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (!arg_num);
+  static char stat_buf[1 << 15];
+  tgl_print_stat (stat_buf, (1 << 15) - 1);
+  if (ev) { mprint_start (ev); }
+  mprintf (ev, "%s\n", stat_buf);
+  if (ev) { mprint_end (ev); }
+  if (!ev) {
+    fflush (stdout);
+  }
+}
+
+void do_history (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 3);
+  if (ev) { ev->refcnt ++; }
+  tgl_do_get_history_ext (args[0].P->id, args[2].num != NOT_FOUND ? args[2].num : 0, args[1].num != NOT_FOUND ? args[1].num : 40, offline_mode, print_msg_list_gw, ev);
+}
+
+void do_dialog_list (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 0);
+  if (ev) { ev->refcnt ++; }
+  tgl_do_get_dialog_list (print_dialog_list_gw, ev);
+}
+
+void do_send_photo (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_send_photo (tgl_message_media_photo, args[0].P->id, args[1].str, 0, 0);
+}
+
+void do_send_audio (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_send_photo (tgl_message_media_audio, args[0].P->id, args[1].str, 0, 0);
+}
+
+void do_send_video (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_send_photo (tgl_message_media_video, args[0].P->id, args[1].str, 0, 0);
+}
+
+void do_send_document (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_send_photo (tgl_message_media_document, args[0].P->id, args[1].str, 0, 0);
+}
+
+void do_send_text (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_send_text (args[0].P->id, args[1].str, 0, 0);
+}
+
+void do_chat_info (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  if (ev) { ev->refcnt ++; }
+  tgl_do_get_chat_info (args[0].P->id, offline_mode, print_chat_info_gw, ev);
+}
+
+void do_user_info (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  if (ev) { ev->refcnt ++; }
+  tgl_do_get_user_info (args[0].P->id, offline_mode, print_user_info_gw, ev);
+}
+
+void do_fwd (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_forward_message (args[0].P->id, args[1].num, 0, 0);
+}
+
+void do_fwd_media (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_forward_message (args[0].P->id, args[1].num, 0, 0);
+}
+
+void do_msg (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_send_message (args[0].P->id, args[1].str, strlen (args[1].str), 0, 0);
+}
+
+void do_rename_chat (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_rename_chat (args[0].P->id, args[1].str, 0, 0);
+}
+
+#define DO_LOAD_PHOTO(tp,act,actf) \
+void do_ ## act ## _ ## tp (int arg_num, struct arg args[], struct in_ev *ev) { \
+  assert (arg_num == 1);\
+  struct tgl_message *M = tgl_message_get (args[0].num);\
+  if (M && !M->service && M->media.type == tgl_message_media_ ## tp) {\
+    if (ev) { ev->refcnt ++; } \
+    tgl_do_load_ ## tp (&M->media.tp, actf, ev); \
+  } else if (M && !M->service && M->media.type == tgl_message_media_ ## tp ## _encr) { \
+    if (ev) { ev->refcnt ++; } \
+    tgl_do_load_encr_video (&M->media.encr_video, actf, ev); \
+  } \
+}
+
+#define DO_LOAD_PHOTO_THUMB(tp,act,actf) \
+void do_ ## act ## _ ## tp ## _thumb (int arg_num, struct arg args[], struct in_ev *ev) { \
+  assert (arg_num == 1);\
+  struct tgl_message *M = tgl_message_get (args[0].num);\
+  if (M && !M->service && M->media.type == tgl_message_media_ ## tp) { \
+    if (ev) { ev->refcnt ++; } \
+    tgl_do_load_ ## tp ## _thumb (&M->media.tp, actf, ev); \
+  }\
+}
+
+DO_LOAD_PHOTO(photo, load, print_filename_gw)
+DO_LOAD_PHOTO(video, load, print_filename_gw)
+DO_LOAD_PHOTO(audio, load, print_filename_gw)
+DO_LOAD_PHOTO(document, load, print_filename_gw)
+DO_LOAD_PHOTO_THUMB(video, load, print_filename_gw)
+DO_LOAD_PHOTO_THUMB(document, load, print_filename_gw)
+DO_LOAD_PHOTO(photo, open, open_filename_gw)
+DO_LOAD_PHOTO(video, open, open_filename_gw)
+DO_LOAD_PHOTO(audio, open, open_filename_gw)
+DO_LOAD_PHOTO(document, open, open_filename_gw)
+DO_LOAD_PHOTO_THUMB(video, open, open_filename_gw)
+DO_LOAD_PHOTO_THUMB(document, open, open_filename_gw)
+
+void do_add_contact (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 3);
+  if (ev) { ev->refcnt ++; }
+  tgl_do_add_contact (args[0].str, strlen (args[0].str), args[1].str, strlen (args[1].str), args[2].str, strlen (args[2].str), 0, print_user_list_gw, ev);
+}
+
+void do_del_contact (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  tgl_do_del_contact (args[0].P->id, 0, 0);
+}
+
+void do_rename_contact (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 3);
+  if (args[0].P->user.phone) {
+    if (ev) { ev->refcnt ++; }
+    tgl_do_add_contact (args[0].P->user.phone, strlen (args[0].P->user.phone), args[1].str, strlen (args[1].str), args[2].str, strlen (args[2].str), 0, print_user_list_gw, ev);
+  }
+}
+
+void do_show_license (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (!arg_num);
+  static char *b = 
+#include "LICENSE.h"
+  ;
+  if (ev) { mprint_start (ev); }
+  mprintf (ev, "%s", b);
+  if (ev) { mprint_end (ev); }
+}
+
+void do_search (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 6);
+  tgl_peer_id_t id;
+  if (args[0].P) {
+    id = args[0].P->id;
+  } else {
+    id = TGL_PEER_NOT_FOUND;
+  }
+  int limit;
+  if (args[1].num != NOT_FOUND) {
+    limit = args[1].num; 
+  } else {
+    limit = 40;
+  }
+  int from;
+  if (args[2].num != NOT_FOUND) {
+    from = args[2].num; 
+  } else {
+    from = 0;
+  }
+  int to;
+  if (args[3].num != NOT_FOUND) {
+    to = args[3].num; 
+  } else {
+    to = 0;
+  }
+  int offset;
+  if (args[4].num != NOT_FOUND) {
+    offset = args[4].num; 
+  } else {
+    offset = 0;
+  }
+  if (ev) { ev->refcnt ++; }
+  tgl_do_msg_search (id, from, to, limit, offset, args[5].str, print_msg_list_gw, ev);
+}
+
+void do_mark_read (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  tgl_do_mark_read (args[0].P->id, 0, 0);
+}
+
+void do_visualize_key (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  static char *colors[4] = {COLOR_GREY, COLOR_CYAN, COLOR_BLUE, COLOR_GREEN};
+  static unsigned char buf[16];
+  memset (buf, 0, sizeof (buf));
+  tgl_peer_id_t id = args[0].P->id;
+  tgl_do_visualize_key (id, buf);
+  mprint_start (ev);
+  int i;
+  for (i = 0; i < 16; i++) {
+    int x = buf[i];
+    int j;
+    for (j = 0; j < 4; j ++) {    
+      if (!ev) {
+        mpush_color (ev, colors[x & 3]);
+        mpush_color (ev, COLOR_INVERSE);
+      }
+      if (!disable_colors && !ev) {
+        mprintf (ev, "  ");
+      } else {
+        switch (x & 3) {
+        case 0:
+          mprintf (ev, "  ");
+          break;
+        case 1:
+          mprintf (ev, "--");
+          break;
+        case 2:
+          mprintf (ev, "==");
+          break;
+        case 3:
+          mprintf (ev, "||");
+          break;
+        }
+      }
+      if (!ev) {
+        mpop_color (ev);
+        mpop_color (ev);
+      }
+      x = x >> 2;
+    }
+    if (i & 1) { 
+      mprintf (ev, "\n"); 
+    }
+  }
+  mprint_end (ev);
+}
+
+void do_create_secret_chat (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  if (ev) { ev->refcnt ++; }
+  tgl_do_create_secret_chat (args[0].P->id, print_secret_chat_gw, ev);
+}
+
+void do_chat_add_user (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 3);
+  tgl_do_add_user_to_chat (args[0].P->id, args[1].P->id, args[2].num != NOT_FOUND ? args[2].num : 100, 0, 0);
+}
+
+void do_chat_del_user (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_del_user_from_chat (args[0].P->id, args[1].P->id, 0, 0);
+}
+
+void do_status_online (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (!arg_num);
+  tgl_do_update_status (1, 0, 0);
+}
+
+void do_status_offline (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (!arg_num);
+  tgl_do_update_status (0, 0, 0);
+}
+
+void do_quit (int arg_num, struct arg args[], struct in_ev *ev) {
+  do_halt (0);
+}
+
+void do_safe_quit (int arg_num, struct arg args[], struct in_ev *ev) {
+  safe_quit = 1;
+}
+
+void do_set (int arg_num, struct arg args[], struct in_ev *ev) {
+  int num = args[1].num;
+  if (!strcmp (args[0].str, "debug_verbosity")) {
+    tgl_set_verbosity (num); 
+  } else if (!strcmp (args[0].str, "log_level")) {
+    log_level = num;
+  } else if (!strcmp (args[0].str, "msg_num")) {
+    msg_num_mode = num;
+  } else if (!strcmp (args[0].str, "alert")) {
+    alert_sound = num;
+  }
+}
+
+void do_chat_with_peer (int arg_num, struct arg args[], struct in_ev *ev) {
+  if (!ev) {
+    in_chat_mode = 1;
+    chat_mode_id = args[0].P->id;
+  }
+}
+
+void do_delete_msg (int arg_num, struct arg args[], struct in_ev *ev) {
+  tgl_do_delete_msg (args[0].num, 0, 0);
+}
+
+void do_restore_msg (int arg_num, struct arg args[], struct in_ev *ev) {
+  tgl_do_restore_msg (args[0].num, 0, 0);
+}
+    
+void do_create_group_chat (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num >= 1 && arg_num <= 1000);
+  static tgl_peer_id_t ids[1000];
+  int i;
+  for (i = 0; i < arg_num - 1; i++) {
+    ids[i] = args[i + 1].P->id;
+  }
+
+  tgl_do_create_group_chat_ex (arg_num - 1, ids, args[0].str, 0, 0);  
+}
+
+void do_chat_set_photo (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_set_chat_photo (args[0].P->id, args[1].str, 0, 0); 
+}
+
+void do_set_profile_photo (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  tgl_do_set_profile_photo (args[0].str, 0, 0);
+}
+
+void do_set_profile_name (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_set_profile_name (args[0].str, args[1].str, print_user_gw, ev);
+}
+
+void do_set_username (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  tgl_do_set_username (args[0].str, print_user_gw, ev);
+}
+
+void do_contact_search (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  tgl_do_contact_search (args[0].str, args[1].num == NOT_FOUND ? args[1].num : 10, print_user_list_gw, ev);
+}
+
+void do_accept_secret_chat (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  tgl_do_accept_encr_chat_request (&args[0].P->encr_chat, 0, 0);
+}
+
+void do_set_ttl (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 2);
+  if (args[0].P->encr_chat.state == sc_ok) {
+    tgl_do_set_encr_chat_ttl (&args[0].P->encr_chat, args[1].num, 0, 0);
+  }
+}
+
+void do_export_card (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (!arg_num);
+  if (ev) { ev->refcnt ++; }
+  tgl_do_export_card (print_card_gw, ev);
+}
+
+void do_import_card (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 1);
+  char *s = args[0].str;
+  int l = strlen (s);
+  if (l > 0) {
+    int i;
+    static int p[10];
+    int pp = 0;
+    int cur = 0;
+    int ok = 1;
+    for (i = 0; i < l; i ++) {
+      if (s[i] >= '0' && s[i] <= '9') {
+        cur = cur * 16 + s[i] - '0';
+      } else if (s[i] >= 'a' && s[i] <= 'f') {
+        cur = cur * 16 + s[i] - 'a' + 10;
+      } else if (s[i] == ':') {
+        if (pp >= 9) { 
+          ok = 0;
+          break;
+        }
+        p[pp ++] = cur;
+        cur = 0;
+      }
+    }
+    if (ok) {
+      p[pp ++] = cur;
+      if (ev) { ev->refcnt ++; }
+      tgl_do_import_card (pp, p, print_user_gw, ev);
+    }
+  }
+}
+
+void do_send_contact (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 4);
+  if (ev) { ev->refcnt ++; }
+  tgl_do_send_contact (args[0].P->id, args[1].str, strlen (args[1].str), args[2].str, strlen (args[2].str), args[3].str, strlen (args[3].str), print_msg_gw, ev);
+}
+
+void do_main_session (int arg_num, struct arg args[], struct in_ev *ev) {
+  if (notify_ev && !--notify_ev->refcnt) {
+    free (notify_ev);
+  }
+  notify_ev = ev;
+  if (ev) { ev->refcnt ++; }
+}
+
+extern char *default_username;
+extern char *config_filename;
+extern char *prefix;
+extern char *auth_file_name;
+extern char *state_file_name;
+extern char *secret_chat_file_name;
+extern char *downloads_directory;
+extern char *config_directory;
+extern char *binlog_file_name;
+extern char *lua_file;
+extern struct event *term_ev;
+
+void do_clear (int arg_num, struct arg args[], struct in_ev *ev) {
+  logprintf ("Do_clear\n");
+  tgl_free_all ();
+  free (default_username);
+  free (config_filename);
+  free (prefix);
+  free (auth_file_name);
+  free (state_file_name);
+  free (secret_chat_file_name);
+  free (downloads_directory);
+  free (config_directory);
+  free (binlog_file_name);
+  free (lua_file);
+  clear_history ();
+  event_free (term_ev);
+  event_base_free (tgl_state.ev_base);
+  do_halt (0);
+}
+
+void do_send_location (int arg_num, struct arg args[], struct in_ev *ev) {
+  assert (arg_num == 3);
+  tgl_do_send_location (args[0].P->id, args[1].dval, args[2].dval, 0, 0);
+}
+
+
+struct command commands[] = {
+  {"help", {ca_none}, do_help, "help\tPrints this help"},
+  {"contact_list", {ca_none}, do_contact_list, "contact_list\tPrints contact list"},
+  {"stats", {ca_none}, do_stats, "stats\tFor debug purpose"},
+  {"history", {ca_peer, ca_number | ca_optional, ca_number | ca_optional, ca_none}, do_history, "history <peer> [limit] [offset]\tPrints messages with this peer (most recent message lower). Also marks messages as read"},
+  {"dialog_list", {ca_none}, do_dialog_list, "dialog_list\tList of last conversations"},
+  {"send_photo", {ca_peer, ca_file_name_end, ca_none}, do_send_photo, "send_photo <peer> <file>\tSends photo to peer"},
+  {"send_video", {ca_peer, ca_file_name_end, ca_none}, do_send_video, "send_video <peer> <file>\tSends video to peer"},
+  {"send_audio", {ca_peer, ca_file_name_end, ca_none}, do_send_audio, "send_audio <peer> <file>\tSends audio to peer"},
+  {"send_document", {ca_peer, ca_file_name_end, ca_none}, do_send_document, "send_document <peer> <file>\tSends document to peer"},
+  {"send_text", {ca_peer, ca_file_name_end, ca_none}, do_send_text, "send_text <peer> <file>\tSends contents of text file as plain text message"},
+  {"chat_info", {ca_chat, ca_none}, do_chat_info, "chat_info <chat>\tPrints info about chat (id, members, admin, etc.)"},
+  {"user_info", {ca_user, ca_none}, do_user_info, "user_info <user>\tPrints info about user (id, last online, phone)"},
+  {"fwd", {ca_peer, ca_number, ca_none}, do_fwd, "fwd <peer> <msg-id>\tForwards message to peer. Forward to secret chats is forbidden"},
+  {"fwd_media", {ca_peer, ca_number, ca_none}, do_fwd_media, "fwd <peer> <msg-id>\tForwards message media to peer. Forward to secret chats is forbidden. Result slightly differs from fwd"},
+  {"msg", {ca_peer, ca_string_end, ca_none}, do_msg, "msg <peer> <text>\tSends text message to peer"},
+  {"rename_chat", {ca_chat, ca_string_end, ca_none}, do_rename_chat, "rename_chat <chat> <new name>\tRenames chat"},
+  {"load_photo", {ca_number, ca_none}, do_load_photo, "load_photo <msg-id>\tDownloads file to downloads dirs. Prints file name after download end"},
+  {"load_video", {ca_number, ca_none}, do_load_video, "load_video <msg-id>\tDownloads file to downloads dirs. Prints file name after download end"},
+  {"load_audio", {ca_number, ca_none}, do_load_audio, "load_audio <msg-id>\tDownloads file to downloads dirs. Prints file name after download end"},
+  {"load_document", {ca_number, ca_none}, do_load_document, "load_document <msg-id>\tDownloads file to downloads dirs. Prints file name after download end"},
+  {"load_video_thumb", {ca_number, ca_none}, do_load_video_thumb, "load_video_thumb <msg-id>\tDownloads file to downloads dirs. Prints file name after download end"},
+  {"load_document_thumb", {ca_number, ca_none}, do_load_document_thumb, "load_document_thumb <msg-id>\tDownloads file to downloads dirs. Prints file name after download end"},
+  {"view_photo", {ca_number, ca_none}, do_open_photo, "view_photo <msg-id>\tDownloads file to downloads dirs. Then tries to open it with system default action"},
+  {"view_video", {ca_number, ca_none}, do_open_video, "view_video <msg-id>\tDownloads file to downloads dirs. Then tries to open it with system default action"},
+  {"view_audio", {ca_number, ca_none}, do_open_audio, "view_audio <msg-id>\tDownloads file to downloads dirs. Then tries to open it with system default action"},
+  {"view_document", {ca_number, ca_none}, do_open_document, "view_document <msg-id>\tDownloads file to downloads dirs. Then tries to open it with system default action"},
+  {"view_video_thumb", {ca_number, ca_none}, do_open_video_thumb, "view_video_thumb <msg-id>\tDownloads file to downloads dirs. Then tries to open it with system default action"},
+  {"view_document_thumb", {ca_number, ca_none}, do_open_document_thumb, "view_document_thumb <msg-id>\tDownloads file to downloads dirs. Then tries to open it with system default action"},
+  {"add_contact", {ca_string, ca_string, ca_string, ca_none}, do_add_contact, "add_contact <phone> <first name> <last name>\tTries to add user to contact list"},
+  {"del_contact", {ca_user, ca_none}, do_del_contact, "del_contact <user>\tDeletes contact from contact list"},
+  {"rename_contact", {ca_user, ca_string, ca_string, ca_none}, do_rename_contact, "rename_contact <user> <first name> <last name>\tRenames contact"},
+  {"show_license", {ca_none}, do_show_license, "show_license\tPrints contents of GPL license"},
+  {"search", {ca_peer | ca_optional, ca_number | ca_optional, ca_number | ca_optional, ca_number | ca_optional, ca_number | ca_optional, ca_string_end}, do_search, "search [peer] [limit] [from] [to] [offset] pattern\tSearch for pattern in messages from date from to date to (unixtime) in messages with peer (if peer not present, in all messages)"},
+  {"mark_read", {ca_peer, ca_none}, do_mark_read, "mark_read <peer>\tMarks messages with peer as read"},
+  {"contact_search", {ca_string, ca_number | ca_optional, ca_none}, do_contact_search, "contact_search username [limit]\tSearches contacts by username"},
+  {"visualize_key", {ca_secret_chat, ca_none}, do_visualize_key, "visualize_key <secret chat>\tPrints visualization of encryption key (first 16 bytes sha1 of it in fact}"},
+  {"create_secret_chat", {ca_user, ca_none}, do_create_secret_chat, "create_secret_chat <user>\tStarts creation of secret chat"},
+  {"chat_add_user", {ca_chat, ca_user, ca_number | ca_optional, ca_none}, do_chat_add_user, "chat_add_user <chat> <user> [msgs-to-forward]\tAdds user to chat. Sends him last msgs-to-forward message from this chat. Default 100"},
+  {"chat_del_user", {ca_chat, ca_user, ca_none}, do_chat_del_user, "chat_del_user <chat> <user>\tDeletes user from chat"},
+  {"status_online", {ca_none}, do_status_online, "status_online\tSets status as online"},
+  {"status_offline", {ca_none}, do_status_offline, "status_offline\tSets status as offline"},
+  {"quit", {ca_none}, do_quit, "quit\tQuits immediately"},
+  {"safe_quit", {ca_none}, do_safe_quit, "safe_quit\tWaits for all queries to end, then quits"},
+  {"set", {ca_string, ca_number, ca_none}, do_set, "set <param> <value>\tSets value of param. Currently available: log_level, debug_verbosity, alarm, msg_num"},
+  {"chat_with_peer", {ca_peer, ca_none}, do_chat_with_peer, "chat_with_peer <peer>\tInterface option. All input will be treated as messages to this peer. Type /quit to end this mode"},
+  {"delete_msg", {ca_number, ca_none}, do_delete_msg, "delete_msg <msg-id>\tDeletes message"},
+  {"restore_msg", {ca_number, ca_none}, do_restore_msg, "restore_msg <msg-id>\tRestores message. Only available shortly (one hour?) after deletion"},
+  {"create_group_chat", {ca_string, ca_user, ca_period, ca_none}, do_create_group_chat, "create_group_chat <name> <user>+\tCreates group chat with users"},
+  {"chat_set_photo", {ca_chat, ca_file_name_end, ca_none}, do_chat_set_photo, "chat_set_photo <chat> <filename>\tSets chat photo. Photo will be cropped to square"},
+  {"set_profile_photo", {ca_file_name_end, ca_none}, do_set_profile_photo, "set_profile_photo <filename>\tSets profile photo. Photo will be cropped to square"},
+  {"set_profile_name", {ca_string, ca_string, ca_none}, do_set_profile_name, "set_profile_name <first-name> <last-name>\tSets profile name."},
+  {"set_username", {ca_string, ca_none}, do_set_username, "set_username <name>\tSets username."},
+  {"accept_secret_chat", {ca_secret_chat, ca_none}, do_accept_secret_chat, "accept_secret_chat <secret chat>\tAccepts secret chat. Only useful with -E option"},
+  {"set_ttl", {ca_secret_chat, ca_number,  ca_none}, do_set_ttl, "set_ttl <secret chat>\tSets secret chat ttl. Client itself ignores ttl"},
+  {"export_card", {ca_none}, do_export_card, "export_card\tPrints card that can be imported by another user with import_card method"},
+  {"import_card", {ca_string, ca_none}, do_import_card, "import_card <card>\tGets user by card and prints it name. You can then send messages to him as usual"},
+  {"send_contact", {ca_peer, ca_string, ca_string, ca_string, ca_none}, do_send_contact, "send_contact <peer> <phone> <first-name> <last-name>\tSends contact (not necessary telegram user)"},
+  {"main_session", {ca_none}, do_main_session, "main_session\tSends updates to this connection (or terminal). Useful only with listening socket"},
+  {"clear", {ca_none}, do_clear, "clear\tClears all data and exits. For debug."},
+  {"send_location", {ca_peer, ca_double, ca_double, ca_none}, do_send_location, "send_location <peer> <latitude> <longitude>\tSends geo location"},
+  {0, {ca_none}, 0, ""}
+};
+
+
+enum command_argument get_complete_mode (void) {
+  force_end_mode = 0;
   line_ptr = rl_line_buffer;
-  int l = 0;
-  char *r = next_token (&l);
-  if (!r) { return 0; }
-  while (r && r[0] == '[' && r[l - 1] == ']') {
-    r = next_token (&l);
-    if (!r) { return 0; }
+
+  while (1) {
+    next_token ();
+    if (cur_token_quoted) { return ca_none; }
+    if (cur_token_len <= 0) { return ca_command; }
+    if (*cur_token == '[') {
+      if (cur_token_end_str) {
+        return ca_modifier; 
+      }
+      if (cur_token[cur_token_len - 1] != ']') {
+        return ca_none;
+      }
+      continue;
+    }
+    break;
   }
-  if (*r == '[' && !r[l]) {
-    return 6;
-  }
- 
-  if (!*line_ptr) { return 0; }
-  char **command = commands;
+  if (cur_token_quoted) { return ca_none; }
+  if (cur_token_end_str) { return ca_command; }
+  if (*cur_token == '(') { return ca_extf; }
+  
+  struct command *command = commands;
   int n = 0;
-  int flags = -1;
-  while (*command) {
-    if (is_same_word (r, l, *command)) {
-      flags = commands_flags[n];
+  struct tgl_command;
+  while (command->name) {
+    if (is_same_word (cur_token, cur_token_len, command->name)) {
       break;
     }
     n ++;
     command ++;
   }
-  if (flags == -1) {
-    return 7;
+  
+  if (!command->name) {
+    return ca_none;
   }
-  int s = 0;
+
+  enum command_argument *flags = command->args;
   while (1) {
-    if (!next_token (&l) || !*line_ptr) {
-      return flags ? flags & 7 : 7;
+    if (*flags == ca_period) {
+      flags --;
     }
-    s ++;
-    if (s <= 4) { flags >>= 3; }
-  }
-}
+    enum command_argument op = (*flags) & 255;
+    int opt = (*flags) & ca_optional;
 
-int complete_user_list (int index, const char *text, int len, char **R) {
-  index ++;
-  while (index < peer_num && (!Peers[index]->print_name || strncmp (Peers[index]->print_name, text, len) || get_peer_type (Peers[index]->id) != PEER_USER)) {
-    index ++;
-  }
-  if (index < peer_num) {
-    *R = strdup (Peers[index]->print_name);
-    return index;
-  } else {
-    return -1;
-  }
-}
+    if (op == ca_none) { return ca_none; }
+    if (op == ca_string_end || op == ca_file_name_end) {
+      next_token_end ();
+      if (cur_token_len < 0 || !cur_token_end_str) { 
+        return ca_none;
+      } else {
+        return op;
+      }
+    }
+    
+    char *save = line_ptr;
+    next_token ();
+    if (op == ca_user || op == ca_chat || op == ca_secret_chat || op == ca_peer || op == ca_number || op == ca_double) {
+      if (cur_token_quoted) {
+        if (opt) {
+          line_ptr = save;
+          flags ++;
+          continue;
+        } else {
+          return ca_none;
+        }
+      } else {
+        if (cur_token_end_str) { return op; }
+        
+        int ok = 1;
+        switch (op) {
+        case ca_user:
+          ok = (tgl_get_peer_type (cur_token_user ()) != NOT_FOUND);
+          break;
+        case ca_chat:
+          ok = (tgl_get_peer_type (cur_token_chat ()) != NOT_FOUND);
+          break;
+        case ca_secret_chat:
+          ok = (tgl_get_peer_type (cur_token_encr_chat ()) != NOT_FOUND);
+          break;
+        case ca_peer:
+          ok = (tgl_get_peer_type (cur_token_user ()) != NOT_FOUND);
+          break;
+        case ca_number:
+          ok = (cur_token_int () != NOT_FOUND);
+          break;
+        case ca_double:
+          ok = (cur_token_double () != NOT_FOUND);
+          break;
+        default:
+          assert (0);
+        }
 
-int complete_chat_list (int index, const char *text, int len, char **R) {
-  index ++;
-  while (index < peer_num && (!Peers[index]->print_name || strncmp (Peers[index]->print_name, text, len) || get_peer_type (Peers[index]->id) != PEER_CHAT)) {
-    index ++;
-  }
-  if (index < peer_num) {
-    *R = strdup (Peers[index]->print_name);
-    return index;
-  } else {
-    return -1;
-  }
-}
+        if (opt && !ok) {
+          line_ptr = save;
+          flags ++;
+          continue;
+        }
+        if (!ok) {
+          return ca_none;
+        }
 
-int complete_encr_chat_list (int index, const char *text, int len, char **R) {
-  index ++;
-  while (index < peer_num && (!Peers[index]->print_name || strncmp (Peers[index]->print_name, text, len) || get_peer_type (Peers[index]->id) != PEER_ENCR_CHAT)) {
-    index ++;
-  }
-  if (index < peer_num) {
-    *R = strdup (Peers[index]->print_name);
-    return index;
-  } else {
-    return -1;
-  }
-}
-
-int complete_user_chat_list (int index, const char *text, int len, char **R) {
-  index ++;
-  while (index < peer_num && (!Peers[index]->print_name || strncmp (Peers[index]->print_name, text, len))) {
-    index ++;
-  }
-  if (index < peer_num) {
-    *R = strdup (Peers[index]->print_name);
-    return index;
-  } else {
-    return -1;
+        flags ++;
+        continue;
+      }
+    }
+    if (op == ca_string || op == ca_file_name) {
+      if (cur_token_end_str) {
+        return op;
+      } else {
+        flags ++;
+        continue;
+      }
+    }
+    assert (0);
   }
 }
 
@@ -476,14 +1228,34 @@ int complete_string_list (char **list, int index, const char *text, int len, cha
   }
   if (list[index]) {
     *R = strdup (list[index]);
+    assert (*R);
     return index;
   } else {
     *R = 0;
     return -1;
   }
 }
+
+int complete_command_list (int index, const char *text, int len, char **R) {
+  index ++;
+  while (commands[index].name && strncmp (commands[index].name, text, len)) {
+    index ++;
+  }
+  if (commands[index].name) {
+    *R = strdup (commands[index].name);
+    assert (*R);
+    return index;
+  } else {
+    *R = 0;
+    return -1;
+  }
+}
+
 char *command_generator (const char *text, int state) {  
-  static int len, index, mode;
+  static int len, index;
+  static enum command_argument mode;
+  static char *command_pos;
+  static int command_len;
 
   if (in_chat_mode) {
     char *R = 0;
@@ -492,50 +1264,58 @@ char *command_generator (const char *text, int state) {
   }
  
   char c = 0;
+  c = rl_line_buffer[rl_point];
+  rl_line_buffer[rl_point] = 0;
   if (!state) {
     len = strlen (text);
     index = -1;
     
-    c = rl_line_buffer[rl_point];
-    rl_line_buffer[rl_point] = 0;
     mode = get_complete_mode ();
+    command_pos = cur_token;
+    command_len = cur_token_len;
   } else {
     if (index == -1) { return 0; }
   }
-
-  if (mode == -1) { 
+  
+  if (mode == ca_none || mode == ca_string || mode == ca_string_end || mode == ca_number || mode == ca_double) { 
     if (c) { rl_line_buffer[rl_point] = c; }
     return 0; 
   }
+  assert (command_len >= 0);
 
   char *R = 0;
-  switch (mode & 7) {
-  case 0:
-    index = complete_string_list (commands, index, text, len, &R);
+  switch (mode & 255) {
+  case ca_command:
+    index = complete_command_list (index, command_pos, command_len, &R);
     if (c) { rl_line_buffer[rl_point] = c; }
     return R;
-  case 1:
-    index = complete_user_list (index, text, len, &R);    
+  case ca_user:
+    index = tgl_complete_user_list (index, command_pos, command_len, &R);    
     if (c) { rl_line_buffer[rl_point] = c; }
     return R;
-  case 2:
-    index = complete_user_chat_list (index, text, len, &R);
+  case ca_peer:
+    index = tgl_complete_peer_list (index, command_pos, command_len, &R);
     if (c) { rl_line_buffer[rl_point] = c; }
     return R;
-  case 3:
-    R = rl_filename_completion_function(text,state);
+  case ca_file_name:
+  case ca_file_name_end:
+    if (c) { rl_line_buffer[rl_point] = c; }
+    R = rl_filename_completion_function (command_pos, state);
+    return R;
+  case ca_chat:
+    index = tgl_complete_chat_list (index, command_pos, command_len, &R);
     if (c) { rl_line_buffer[rl_point] = c; }
     return R;
-  case 4:
-    index = complete_chat_list (index, text, len, &R);
+  case ca_secret_chat:
+    index = tgl_complete_encr_chat_list (index, command_pos, command_len, &R);
     if (c) { rl_line_buffer[rl_point] = c; }
     return R;
-  case 5:
-    index = complete_encr_chat_list (index, text, len, &R);
+  case ca_modifier:
+    index = complete_string_list (modifiers, index, command_pos, command_len, &R);
     if (c) { rl_line_buffer[rl_point] = c; }
     return R;
-  case 6:
-    index = complete_string_list (modifiers, index, text, len, &R);
+  case ca_extf:
+    index = tglf_extf_autocomplete (text, len, index, &R, rl_line_buffer, rl_point);
     if (c) { rl_line_buffer[rl_point] = c; }
     return R;
   default:
@@ -548,7 +1328,6 @@ char **complete_text (char *text, int start UU, int end UU) {
   return (char **) rl_completion_matches (text, command_generator);
 }
 
-int offline_mode;
 int count = 1;
 void work_modifier (const char *s, int l) {
   if (is_same_word (s, l, "[offline]")) {
@@ -560,7 +1339,203 @@ void work_modifier (const char *s, int l) {
 #endif
 }
 
+void print_msg_list_gw (void *extra, int success, int num, struct tgl_message *ML[]) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  mprint_start (ev);
+  int i;
+  for (i = num - 1; i >= 0; i--) {
+    print_message (ev, ML[i]);
+  }
+  mprint_end (ev);
+}
 
+void print_msg_gw (void *extra, int success, struct tgl_message *M) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  mprint_start (ev);
+  print_message (ev, M);
+  mprint_end (ev);
+}
+
+void print_user_list_gw (void *extra, int success, int num, struct tgl_user *UL[]) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  mprint_start (ev);
+  int i;
+  for (i = num - 1; i >= 0; i--) {
+    print_user_name (ev, UL[i]->id, (void *)UL[i]);
+    mprintf (ev, "\n");
+  }
+  mprint_end (ev);
+}
+
+void print_user_gw (void *extra, int success, struct tgl_user *U) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  mprint_start (ev);
+  print_user_name (ev, U->id, (void *)U);
+  mprintf (ev, "\n");
+  mprint_end (ev);
+}
+
+void print_filename_gw (void *extra, int success, char *name) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  mprint_start (ev);
+  mprintf (ev, "Saved to %s\n", name);
+  mprint_end (ev);
+}
+
+void open_filename_gw (void *extra, int success, char *name) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (ev) { return; }
+  if (!success) { return; }
+  static char buf[PATH_MAX];
+  if (snprintf (buf, sizeof (buf), OPEN_BIN, name) >= (int) sizeof (buf)) {
+    logprintf ("Open image command buffer overflow\n");
+  } else {
+    int x = system (buf);
+    if (x < 0) {
+      logprintf ("Can not open image viewer: %m\n");
+      logprintf ("Image is at %s\n", name);
+    }
+  }
+}
+
+void print_chat_info_gw (void *extra, int success, struct tgl_chat *C) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { 
+    vlogprintf (E_NOTICE, "Failed to get chat info\n");
+    return; 
+  }
+  mprint_start (ev);
+
+  tgl_peer_t *U = (void *)C;
+  mpush_color (ev, COLOR_YELLOW);
+  mprintf (ev, "Chat ");
+  print_chat_name (ev, U->id, U);
+  mprintf (ev, " (id %d) members:\n", tgl_get_peer_id (U->id));
+  int i;
+  for (i = 0; i < C->user_list_size; i++) {
+    mprintf (ev, "\t\t");
+    print_user_name (ev, TGL_MK_USER (C->user_list[i].user_id), tgl_peer_get (TGL_MK_USER (C->user_list[i].user_id)));
+    mprintf (ev, " invited by ");
+    print_user_name (ev, TGL_MK_USER (C->user_list[i].inviter_id), tgl_peer_get (TGL_MK_USER (C->user_list[i].inviter_id)));
+    mprintf (ev, " at ");
+    print_date_full (ev, C->user_list[i].date);
+    if (C->user_list[i].user_id == C->admin_id) {
+      mprintf (ev, " admin");
+    }
+    mprintf (ev, "\n");
+  }
+  mpop_color (ev);
+  mprint_end (ev);
+}
+
+void print_user_info_gw (void *extra, int success, struct tgl_user *U) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  tgl_peer_t *C = (void *)U;
+  mprint_start (ev);
+  mpush_color (ev, COLOR_YELLOW);
+  mprintf (ev, "User ");
+  print_user_name (ev, U->id, C);
+  if (U->username) {
+    mprintf (ev, " @%s", U->username);
+  }
+  mprintf (ev, " (#%d):\n", tgl_get_peer_id (U->id));
+  mprintf (ev, "\treal name: %s %s\n", U->real_first_name, U->real_last_name);
+  mprintf (ev, "\tphone: %s\n", U->phone);
+  if (U->status.online > 0) {
+    mprintf (ev, "\tonline\n");
+  } else {
+    mprintf (ev, "\toffline (was online ");
+    print_date_full (ev, U->status.when);
+    mprintf (ev, ")\n");
+  }
+  mpop_color (ev);
+  mprint_end (ev);
+}
+
+void print_secret_chat_gw (void *extra, int success, struct tgl_secret_chat *E) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  mprint_start (ev);
+  mpush_color (ev, COLOR_YELLOW);
+  mprintf (ev, " Encrypted chat ");
+  print_encr_chat_name (ev, E->id, (void *)E);
+  mprintf (ev, " is now in wait state\n");
+  mpop_color (ev);
+  mprint_end (ev);
+}
+
+void print_dialog_list_gw (void *extra, int success, int size, tgl_peer_id_t peers[], int last_msg_id[], int unread_count[]) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  mprint_start (ev);
+  mpush_color (ev, COLOR_YELLOW);
+  int i;
+  for (i = size - 1; i >= 0; i--) {
+    tgl_peer_t *UC;
+    switch (tgl_get_peer_type (peers[i])) {
+    case TGL_PEER_USER:
+      UC = tgl_peer_get (peers[i]);
+      mprintf (ev, "User ");
+      print_user_name (ev, peers[i], UC);
+      mprintf (ev, ": %d unread\n", unread_count[i]);
+      break;
+    case TGL_PEER_CHAT:
+      UC = tgl_peer_get (peers[i]);
+      mprintf (ev, "Chat ");
+      print_chat_name (ev, peers[i], UC);
+      mprintf (ev, ": %d unread\n", unread_count[i]);
+      break;
+    }
+  }
+  mpop_color (ev);
+  mprint_end (ev);
+}
 
 void interpreter_chat_mode (char *line) {
   if (line == NULL || /* EOF received */
@@ -573,19 +1548,382 @@ void interpreter_chat_mode (char *line) {
     int limit = 40;
     sscanf (line, "/history %99d", &limit);
     if (limit < 0 || limit > 1000) { limit = 40; }
-    do_get_history (chat_mode_id, limit);
+    tgl_do_get_history (chat_mode_id, limit, offline_mode, print_msg_list_gw, 0);
     return;
   }
   if (!strncmp (line, "/read", 5)) {
-    do_mark_read (chat_mode_id);
+    tgl_do_mark_read (chat_mode_id, 0, 0);
     return;
   }
-  if (strlen (line)>0) {
-    do_send_message (chat_mode_id, line, strlen (line));
+  if (strlen (line) > 0) {
+    tgl_do_send_message (chat_mode_id, line, strlen (line), 0, 0);
   }
 }
 
-void interpreter (char *line UU) {
+#define MAX_UNREAD_MESSAGE_COUNT 10000
+struct tgl_message *unread_message_list[MAX_UNREAD_MESSAGE_COUNT];
+int unread_message_count;
+struct event *unread_message_event;
+
+
+void print_read_list (int num, struct tgl_message *list[]) {
+  struct in_ev *ev = notify_ev;
+  int i;
+  mprint_start (ev);
+  for (i = 0; i < num; i++) if (list[i]) {
+    tgl_peer_id_t to_id;
+    if (tgl_get_peer_type (list[i]->to_id) == TGL_PEER_USER && tgl_get_peer_id (list[i]->to_id) == tgl_state.our_id) {
+      to_id = list[i]->from_id;
+    } else {
+      to_id = list[i]->to_id;
+    }
+    int j;
+    int c1 = 0;
+    int c2 = 0;
+    for (j = i; j < num; j++) if (list[j]) {
+      tgl_peer_id_t end_id;
+      if (tgl_get_peer_type (list[j]->to_id) == TGL_PEER_USER && tgl_get_peer_id (list[j]->to_id) == tgl_state.our_id) {
+        end_id = list[j]->from_id;
+      } else {
+        end_id = list[j]->to_id;
+      }
+      if (!tgl_cmp_peer_id (to_id, end_id)) {
+        if (list[j]->out) {
+          c1 ++;
+        } else {
+          c2 ++;
+        }
+        list[j] = 0;
+      }
+    }
+
+    assert (c1 + c2 > 0);
+    mpush_color (ev, COLOR_YELLOW);
+    switch (tgl_get_peer_type (to_id)) {
+    case TGL_PEER_USER:
+      mprintf (ev, "User ");
+      print_user_name (ev, to_id, tgl_peer_get (to_id));    
+      break;
+    case TGL_PEER_CHAT:
+      mprintf (ev, "Chat ");
+      print_chat_name (ev, to_id, tgl_peer_get (to_id));    
+      break;
+    case TGL_PEER_ENCR_CHAT:
+      mprintf (ev, "Secret chat ");
+      print_encr_chat_name (ev, to_id, tgl_peer_get (to_id));    
+      break;
+    default:
+      assert (0);
+    }
+    mprintf (ev, " marked read %d outbox and %d inbox messages\n", c1, c2);
+    mpop_color (ev);
+  }
+  mprint_end (ev);
+}
+
+void unread_message_alarm (evutil_socket_t fd, short what, void *arg) {
+  print_read_list (unread_message_count, unread_message_list);
+  unread_message_count = 0;
+  event_free (unread_message_event);
+  unread_message_event = 0;
+}
+
+void mark_read_upd (int num, struct tgl_message *list[]) {
+  if (!binlog_read) { return; }
+  if (log_level < 1) { return; }
+
+  if (unread_message_count + num <= MAX_UNREAD_MESSAGE_COUNT) {
+    memcpy (unread_message_list + unread_message_count, list, num * sizeof (void *));
+    unread_message_count += num;
+
+    if (!unread_message_event) {
+      unread_message_event = evtimer_new (tgl_state.ev_base, unread_message_alarm, 0);
+      static struct timeval ptimeout = { 1, 0};
+      event_add (unread_message_event, &ptimeout);
+    }
+  } else {
+    print_read_list (unread_message_count, unread_message_list);
+    print_read_list (num, list);
+    unread_message_count = 0;
+    if (unread_message_event) {
+      event_free (unread_message_event);
+      unread_message_event = 0;
+    }
+  }
+}
+
+void print_typing (struct in_ev *ev, enum tgl_typing_status status) {
+  switch (status) {
+  case tgl_typing_none:
+    mprintf (ev, "doing nothing");
+    break;
+  case tgl_typing_typing:
+    mprintf (ev, "typing");
+    break;
+  case tgl_typing_cancel:
+    mprintf (ev, "deleting typed message");
+    break;
+  case tgl_typing_record_video:
+    mprintf (ev, "recording video");
+    break;
+  case tgl_typing_upload_video:
+    mprintf (ev, "uploading video");
+    break;
+  case tgl_typing_record_audio:
+    mprintf (ev, "recording audio");
+    break;
+  case tgl_typing_upload_audio:
+    mprintf (ev, "uploading audio");
+    break;
+  case tgl_typing_upload_photo:
+    mprintf (ev, "uploading photo");
+    break;
+  case tgl_typing_upload_document:
+    mprintf (ev, "uploading document");
+    break;
+  case tgl_typing_geo:
+    mprintf (ev, "choosing location");
+    break;
+  case tgl_typing_choose_contact:
+    mprintf (ev, "choosing contact");
+    break;
+  }
+}
+
+void type_notification_upd (struct tgl_user *U, enum tgl_typing_status status) {
+  if (log_level < 2 || (disable_output && !notify_ev)) { return; }
+  struct in_ev *ev = notify_ev;
+  mprint_start (ev);
+  mpush_color (ev, COLOR_YELLOW);
+  mprintf (ev, "User ");
+  print_user_name (ev, U->id, (void *)U);
+  mprintf (ev, " is ");
+  print_typing (ev, status);
+  mprintf (ev, "\n");
+  mpop_color (ev);
+  mprint_end (ev);
+}
+
+void type_in_chat_notification_upd (struct tgl_user *U, struct tgl_chat *C, enum tgl_typing_status status) {
+  if (log_level < 2 || (disable_output && !notify_ev)) { return; }
+  struct in_ev *ev = notify_ev;
+  mprint_start (ev);
+  mpush_color (ev, COLOR_YELLOW);
+  mprintf (ev, "User ");
+  print_user_name (ev, U->id, (void *)U);
+  mprintf (ev, " is ");
+  print_typing (ev, status);
+  mprintf (ev, " in chat ");
+  print_chat_name (ev, C->id, (void *)C);
+  mprintf (ev, "\n");
+  mpop_color (ev);
+  mprint_end (ev);
+}
+
+
+void print_message_gw (struct tgl_message *M) {
+  #ifdef USE_LUA
+    lua_new_msg (M);
+  #endif
+  if (!binlog_read) { return; }
+  if (alert_sound) {
+    play_sound ();
+  }
+  if (disable_output && !notify_ev) { return; }
+  struct in_ev *ev = notify_ev;
+  mprint_start (ev);
+  print_message (ev, M);
+  mprint_end (ev);
+}
+
+void our_id_gw (int id) {
+  #ifdef USE_LUA
+    lua_our_id (id);
+  #endif
+}
+
+void print_peer_updates (struct in_ev *ev, int flags) {
+  if (flags & TGL_UPDATE_PHONE) {
+    mprintf (ev, " phone");
+  }
+  if (flags & TGL_UPDATE_CONTACT) {
+    mprintf (ev, " contact");
+  }
+  if (flags & TGL_UPDATE_PHOTO) {
+    mprintf (ev, " photo");
+  }
+  if (flags & TGL_UPDATE_BLOCKED) {
+    mprintf (ev, " blocked");
+  }
+  if (flags & TGL_UPDATE_REAL_NAME) {
+    mprintf (ev, " name");
+  }
+  if (flags & TGL_UPDATE_NAME) {
+    mprintf (ev, " contact_name");
+  }
+  if (flags & TGL_UPDATE_REQUESTED) {
+    mprintf (ev, " status");
+  }
+  if (flags & TGL_UPDATE_WORKING) {
+    mprintf (ev, " status");
+  }
+  if (flags & TGL_UPDATE_FLAGS) {
+    mprintf (ev, " flags");
+  }
+  if (flags & TGL_UPDATE_TITLE) {
+    mprintf (ev, " title");
+  }
+  if (flags & TGL_UPDATE_ADMIN) {
+    mprintf (ev, " admin");
+  }
+  if (flags & TGL_UPDATE_MEMBERS) {
+    mprintf (ev, " members");
+  }
+  if (flags & TGL_UPDATE_ACCESS_HASH) {
+    mprintf (ev, " access_hash");
+  }
+  if (flags & TGL_UPDATE_USERNAME) {
+    mprintf (ev, " username");
+  }
+}
+
+void user_update_gw (struct tgl_user *U, unsigned flags) {
+  #ifdef USE_LUA
+    lua_user_update (U, flags);
+  #endif
+  
+  if (disable_output && !notify_ev) { return; }
+  if (!binlog_read) { return; }
+  struct in_ev *ev = notify_ev;
+
+  if (!(flags & TGL_UPDATE_CREATED)) {
+    mprint_start (ev);
+    mpush_color (ev, COLOR_YELLOW);
+    mprintf (ev, "User ");
+    print_user_name (ev, U->id, (void *)U);
+    if (!(flags & TGL_UPDATE_DELETED)) {
+      mprintf (ev, " updated");
+      print_peer_updates (ev, flags);
+    } else {
+      mprintf (ev, " deleted");
+    }
+    mprintf (ev, "\n");
+    mpop_color (ev);
+    mprint_end (ev);
+  }
+}
+
+void chat_update_gw (struct tgl_chat *U, unsigned flags) {
+  #ifdef USE_LUA
+    lua_chat_update (U, flags);
+  #endif
+  
+  if (disable_output && !notify_ev) { return; }
+  if (!binlog_read) { return; }
+  struct in_ev *ev = notify_ev;
+
+  if (!(flags & TGL_UPDATE_CREATED)) {
+    mprint_start (ev);
+    mpush_color (ev, COLOR_YELLOW);
+    mprintf (ev, "Chat ");
+    print_chat_name (ev, U->id, (void *)U);
+    if (!(flags & TGL_UPDATE_DELETED)) {
+      mprintf (ev, " updated");
+      print_peer_updates (ev, flags);
+    } else {
+      mprintf (ev, " deleted");
+    }
+    mprintf (ev, "\n");
+    mpop_color (ev);
+    mprint_end (ev);
+  }
+}
+
+void secret_chat_update_gw (struct tgl_secret_chat *U, unsigned flags) {
+  #ifdef USE_LUA
+    lua_secret_chat_update (U, flags);
+  #endif
+  
+  if ((flags & TGL_UPDATE_WORKING) || (flags & TGL_UPDATE_DELETED)) {
+    write_secret_chat_file ();
+  }
+  
+  if (!binlog_read) { return; }
+
+  if ((flags & TGL_UPDATE_REQUESTED) && !disable_auto_accept)  {
+    tgl_do_accept_encr_chat_request (U, 0, 0);
+  }
+  
+  if (disable_output && !notify_ev) { return; }
+  struct in_ev *ev = notify_ev;
+
+
+  if (!(flags & TGL_UPDATE_CREATED)) {
+    mprint_start (ev);
+    mpush_color (ev, COLOR_YELLOW);
+    mprintf (ev, "Secret chat ");
+    print_encr_chat_name (ev, U->id, (void *)U);
+    if (!(flags & TGL_UPDATE_DELETED)) {
+      mprintf (ev, " updated");
+      print_peer_updates (ev, flags);
+    } else {
+      mprintf (ev, " deleted");
+    }
+    mprintf (ev, "\n");
+    mpop_color (ev);
+    mprint_end (ev);
+  }
+}
+
+void print_card_gw (void *extra, int success, int size, int *card) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  mprint_start (ev);
+  mprintf (ev, "Card: ");
+  int i;
+  for (i = 0; i < size; i++) {
+    mprintf (ev, "%08x%c", card[i], i == size - 1 ? '\n' : ':');
+  }
+  mprint_end (ev);
+}
+
+void callback_extf (void *extra, int success, char *buf) {
+  struct in_ev *ev = extra;
+  if (ev && !--ev->refcnt) {
+    free (ev);
+    return;
+  }
+  if (!success) { return; }
+  mprint_start (ev);
+  mprintf (ev, "%s\n", buf);
+  mprint_end (ev);
+}
+
+struct tgl_update_callback upd_cb = {
+  .new_msg = print_message_gw,
+  .marked_read = mark_read_upd,
+  .logprintf = logprintf,
+  .type_notification = type_notification_upd,
+  .type_in_chat_notification = type_in_chat_notification_upd,
+  .type_in_secret_chat_notification = 0,
+  .status_notification = 0,
+  .user_registered = 0,
+  .user_activated = 0,
+  .new_authorization = 0,
+  .user_update = user_update_gw,
+  .chat_update = chat_update_gw,
+  .secret_chat_update = secret_chat_update_gw,
+  .msg_receive = print_message_gw,
+  .our_id = our_id_gw
+};
+
+
+void interpreter_ex (char *line UU, void *ex) {
+  force_end_mode = 1;
   assert (!in_readline);
   in_readline = 1;
   if (in_chat_mode) {
@@ -598,552 +1936,252 @@ void interpreter (char *line UU) {
   offline_mode = 0;
   count = 1;
   if (!line) { 
+    do_safe_quit (0, NULL, NULL);
     in_readline = 0;
     return; 
   }
   if (line && *line) {
     add_history (line);
   }
+  
+  if (*line == '(') { 
+    struct in_ev *ev = ex;
+    if (ev) { ev->refcnt ++; }
+    tgl_do_send_extf (line, strlen (line), callback_extf, ev);
+    in_readline = 0;
+    return; 
+  }
 
-  int l;
-  char *command;
   while (1) {
-    command = next_token (&l);
-    if (!command) { in_readline = 0; return; }
-    if (*command == '[' && command[l - 1] == ']') {
-      work_modifier (command, l);
-    } else {
+    next_token ();
+    if (cur_token_quoted) { 
+      in_readline = 0;
+      return; 
+    }
+
+    if (cur_token_len <= 0) { 
+      in_readline = 0;
+      return; 
+    }
+    
+    if (*cur_token == '[') {
+      if (cur_token_end_str) {
+        in_readline = 0;
+        return; 
+      }
+      if (cur_token[cur_token_len - 1] != ']') {
+        in_readline = 0;
+        return; 
+      }
+      work_modifier (cur_token, cur_token_len);
+      continue;
+    }
+    break;
+  }
+  if (cur_token_quoted || cur_token_end_str) { 
+    in_readline = 0;
+    return; 
+  }
+    
+    
+  
+  struct command *command = commands;
+  int n = 0;
+  struct tgl_command;
+  while (command->name) {
+    if (is_same_word (cur_token, cur_token_len, command->name)) {
       break;
     }
+    n ++;
+    command ++;
+  }
+  
+  if (!command->name) {
+    in_readline = 0;
+    return; 
   }
 
-  int _;
-  char *save = line_ptr;
-  int ll = l;
-  char *cs = command;
-  for (_ = 0; _ < count; _ ++) {
-    line_ptr = save;
-    l = ll;
-    command = cs;
-#define IS_WORD(s) is_same_word (command, l, (s))
-#define RET in_readline = 0; return; 
+  enum command_argument *flags = command->args;
+  void (*fun)(int, struct arg[], struct in_ev *) = command->fun;
+  int args_num = 0;
+  static struct arg args[1000];
+  while (1) {
+    assert (args_num < 1000);
+    args[args_num].flags = 0;
+    int period = 0;
+    if (*flags == ca_period) {
+      period = 1;
+      flags --;
+    }
+    enum command_argument op = (*flags) & 255;
+    int opt = (*flags) & ca_optional;
 
-  peer_id_t id;
-#define GET_PEER \
-  id = next_token_peer (); \
-  if (!cmp_peer_id (id, PEER_NOT_FOUND)) { \
-    printf ("Bad user/chat id\n"); \
-    RET; \
-  } 
-#define GET_PEER_USER \
-  id = next_token_user (); \
-  if (!cmp_peer_id (id, PEER_NOT_FOUND)) { \
-    printf ("Bad user id\n"); \
-    RET; \
-  } 
-#define GET_PEER_CHAT \
-  id = next_token_chat (); \
-  if (!cmp_peer_id (id, PEER_NOT_FOUND)) { \
-    printf ("Bad chat id\n"); \
-    RET; \
-  } 
-#define GET_PEER_ENCR_CHAT \
-  id = next_token_encr_chat (); \
-  if (!cmp_peer_id (id, PEER_NOT_FOUND)) { \
-    printf ("Bad encr_chat id\n"); \
-    RET; \
-  } 
+    if (op == ca_none) { 
+      next_token ();
+      if (cur_token_end_str) {
+        int z;
+        for (z = 0; z < count; z ++) {
+          fun (args_num, args, ex);
+        }
+      }
+      break;
+    }
+      
+    if (op == ca_string_end || op == ca_file_name_end) {
+      next_token_end ();
+      if (cur_token_len < 0) { 
+        break;
+      } else {
+        args[args_num].flags = 1;
+        args[args_num ++].str = strndup (cur_token, cur_token_len);
+        int z;
+        for (z = 0; z < count; z ++) {
+          fun (args_num, args, ex);
+        }
+        break;
+      }
+    }
 
-  if (IS_WORD ("contact_list")) {
-    do_update_contact_list ();
-  } else if (IS_WORD ("dialog_list")) {
-    do_get_dialog_list ();
-  } else if (IS_WORD ("stats")) {
-    static char stat_buf[1 << 15];
-    print_stat (stat_buf, (1 << 15) - 1);
-    printf ("%s\n", stat_buf);
-  } else if (IS_WORD ("msg")) {
-    GET_PEER;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty message\n");
-      RET;
+    char *save = line_ptr;
+    next_token ();
+
+    if (period && cur_token_end_str) {
+      int z;
+      for (z = 0; z < count; z ++) {
+        fun (args_num, args, ex);
+      }
+      break;
     }
-    do_send_message (id, s, strlen (s));
-  } else if (IS_WORD ("rename_chat")) {
-    GET_PEER_CHAT;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty new name\n");
-      RET;
+
+    if (op == ca_user || op == ca_chat || op == ca_secret_chat || op == ca_peer || op == ca_number || op == ca_double) {
+      if (cur_token_quoted) {
+        if (opt) {
+          if (op != ca_number && op != ca_double) {
+            args[args_num ++].P = 0;
+          } else {
+            if (op == ca_number) {
+              args[args_num ++].num = NOT_FOUND;
+            } else {
+              args[args_num ++].dval = NOT_FOUND;
+            }
+          }
+          line_ptr = save;
+          flags ++;
+          continue;
+        } else {
+          break;
+        }
+      } else {
+        if (cur_token_end_str) { 
+          if (opt) {
+            if (op != ca_number && op != ca_double) {
+              args[args_num ++].P = 0;
+            } else {
+              if (op == ca_number) {
+                args[args_num ++].num = NOT_FOUND;
+              } else {
+                args[args_num ++].dval = NOT_FOUND;
+              }
+            }
+            line_ptr = save;
+            flags ++;
+            continue;
+          } else {
+            break;
+          }
+        }
+        int ok = 1;
+        switch (op) {
+        case ca_user:
+          args[args_num ++].P = mk_peer (cur_token_user ()); 
+          ok = args[args_num - 1].P != NULL;
+          break;
+        case ca_chat:
+          args[args_num ++].P = mk_peer (cur_token_chat ()); 
+          ok = args[args_num - 1].P != NULL;
+          break;
+        case ca_secret_chat:
+          args[args_num ++].P = mk_peer (cur_token_encr_chat ()); 
+          ok = args[args_num - 1].P != NULL;
+          break;
+        case ca_peer:
+          args[args_num ++].P = mk_peer (cur_token_peer ()); 
+          ok = args[args_num - 1].P != NULL;
+          break;
+        case ca_number:
+          args[args_num ++].num = cur_token_int ();
+          ok = (args[args_num - 1].num != NOT_FOUND);
+          break;
+        case ca_double:
+          args[args_num ++].dval = cur_token_double ();
+          ok = (args[args_num - 1].dval != NOT_FOUND);
+          break;
+        default:
+          assert (0);
+        }
+
+        if (opt && !ok) {
+          line_ptr = save;
+          flags ++;
+          continue;
+        }
+        if (!ok) {
+          break;
+        }
+
+        flags ++;
+        continue;
+      }
     }
-    do_rename_chat (id, s);
-  } else if (IS_WORD ("send_photo")) {
-    GET_PEER;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty file name\n");
-      RET;
+    if (op == ca_string || op == ca_file_name) {
+      if (cur_token_end_str || cur_token_len < 0) {
+        break;
+      } else {
+        args[args_num].flags = 1;
+        args[args_num ++].str = strndup (cur_token, cur_token_len);
+        flags ++;
+        continue;
+      }
     }
-    do_send_photo (CODE_input_media_uploaded_photo, id, tstrndup (s, t));
-  } else if (IS_WORD("send_video")) {
-    GET_PEER;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty file name\n");
-      RET;
-    }
-    do_send_photo (CODE_input_media_uploaded_video, id, tstrndup (s, t));
-  } else if (IS_WORD ("send_text")) {
-    GET_PEER;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty file name\n");
-      RET;
-    }
-    do_send_text (id, tstrndup (s, t));
-  } else if (IS_WORD ("fwd")) {
-    GET_PEER;
-    int num = next_token_int ();
-    if (num == NOT_FOUND || num <= 0) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    do_forward_message (id, num);
-  } else if (IS_WORD ("load_photo")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_photo) {
-      do_load_photo (&M->media.photo, 1);
-    } else if (M && !M->service && M->media.type == CODE_decrypted_message_media_photo) {
-      do_load_encr_video (&M->media.encr_video, 1); // this is not a bug. 
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("view_photo")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_photo) {
-      do_load_photo (&M->media.photo, 2);
-    } else if (M && !M->service && M->media.type == CODE_decrypted_message_media_photo) {
-      do_load_encr_video (&M->media.encr_video, 2); // this is not a bug. 
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("load_video_thumb")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_video) {
-      do_load_video_thumb (&M->media.video, 1);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("view_video_thumb")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_video) {
-      do_load_video_thumb (&M->media.video, 2);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("load_video")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_video) {
-      do_load_video (&M->media.video, 1);
-    } else if (M && !M->service && M->media.type == CODE_decrypted_message_media_video) {
-      do_load_encr_video (&M->media.encr_video, 1);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("view_video")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_video) {
-      do_load_video (&M->media.video, 2);
-    } else if (M && !M->service && M->media.type == CODE_decrypted_message_media_video) {
-      do_load_encr_video (&M->media.encr_video, 2);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("chat_info")) {
-    GET_PEER_CHAT;
-    do_get_chat_info (id);
-  } else if (IS_WORD ("user_info")) {
-    GET_PEER_USER;
-    do_get_user_info (id);
-  } else if (IS_WORD ("history")) {
-    GET_PEER;
-    int limit = next_token_int ();
-    do_get_history (id, limit > 0 ? limit : 40);
-  } else if (IS_WORD ("chat_add_user")) {
-    GET_PEER_CHAT;    
-    peer_id_t chat_id = id;
-    GET_PEER_USER;
-    do_add_user_to_chat (chat_id, id, 100);
-  } else if (IS_WORD ("chat_del_user")) {
-    GET_PEER_CHAT;    
-    peer_id_t chat_id = id;
-    GET_PEER_USER;
-    do_del_user_from_chat (chat_id, id);
-  } else if (IS_WORD ("add_contact")) {
-    int phone_len, first_name_len, last_name_len;
-    char *phone, *first_name, *last_name;
-    phone = next_token (&phone_len);
-    if (!phone) {
-      printf ("No phone number found\n");
-      RET;
-    }
-    first_name = next_token (&first_name_len);
-    if (!first_name_len) {
-      printf ("No first name found\n");
-      RET;
-    }
-    last_name = next_token (&last_name_len);
-    if (!last_name_len) {
-      printf ("No last name found\n");
-      RET;
-    }
-    do_add_contact (phone, phone_len, first_name, first_name_len, last_name, last_name_len, 0);
-  } else if (IS_WORD ("rename_contact")) {
-    GET_PEER_USER;
-    peer_t *U = user_chat_get (id);
-    if (!U) {
-      printf ("No such user\n");
-      RET;
-    }
-    if (!U->user.phone || !strlen (U->user.phone)) {
-      printf ("User has no phone. Can not rename\n");
-      RET;
-    }
-    int phone_len, first_name_len, last_name_len;
-    char *phone, *first_name, *last_name;
-    phone_len = strlen (U->user.phone);
-    phone = U->user.phone;
-    first_name = next_token (&first_name_len);
-    if (!first_name_len) {
-      printf ("No first name found\n");
-      RET;
-    }
-    last_name = next_token (&last_name_len);
-    if (!last_name_len) {
-      printf ("No last name found\n");
-      RET;
-    }
-    do_add_contact (phone, phone_len, first_name, first_name_len, last_name, last_name_len, 1);
-  } else if (IS_WORD ("help")) {
-    //print_start ();
-    push_color (COLOR_YELLOW);
-    printf (
-      "help - prints this help\n"
-      "msg <peer> Text - sends message to this peer\n"
-      "contact_list - prints info about users in your contact list\n"
-      "stats - just for debugging \n"
-      "history <peer> [limit] - prints history (and marks it as read). Default limit = 40\n"
-      "dialog_list - prints info about your dialogs\n"
-      "send_photo <peer> <photo-file-name> - sends photo to peer\n"
-      "send_video <peer> <video-file-name> - sends video to peer\n"
-      "send_text <peer> <text-file-name> - sends text file as plain messages\n"
-      "chat_info <chat> - prints info about chat\n"
-      "user_info <user> - prints info about user\n"
-      "fwd <user> <msg-seqno> - forward message to user. You can see message numbers starting client with -N\n"
-      "rename_chat <chat> <new-name>\n"
-      "load_photo/load_video/load_video_thumb <msg-seqno> - loads photo/video to download dir. You can see message numbers starting client with -N\n"
-      "view_photo/view_video/view_video_thumb <msg-seqno> - loads photo/video to download dir and starts system default viewer. You can see message numbers starting client with -N\n"
-      "show_license - prints contents of GPLv2\n"
-      "search <peer> pattern - searches pattern in messages with peer\n"
-      "global_search pattern - searches pattern in all messages\n"
-      "mark_read <peer> - mark read all received messages with peer\n"
-      "add_contact <phone-number> <first-name> <last-name> - tries to add contact to contact-list by phone\n"
-      "create_secret_chat <user> - creates secret chat with this user\n"
-      "create_group_chat <user> <chat-topic> - creates group chat with this user, add more users with chat_add_user <user>\n"
-      "rename_contact <user> <first-name> <last-name> - tries to rename contact. If you have another device it will be a fight\n"
-      "suggested_contacts - print info about contacts, you have max common friends\n"
-      "visualize_key <secret_chat> - prints visualization of encryption key. You should compare it to your partner's one\n"
-      "set <param> <param-value>. Possible <param> values are:\n"
-      "\tdebug_verbosity - just as it sounds. Debug verbosity\n"
-      "\tlog_level - level of logging of new events. Lower is less verbose:\n"
-      "\t\tLevel 1: prints info about read messages\n"
-      "\t\tLevel 2: prints line, when somebody is typing in chat\n"
-      "\t\tLevel 3: prints line, when somebody changes online status\n"
-      "\tmsg_num - enables/disables numeration of messages\n"
-      "\talert - enables/disables alert sound notifications\n"
-      "chat_with_peer <peer> - starts chat with this peer. Every command after is message to this peer. Type /exit or /quit to end this mode\n"
-      );
-    pop_color ();
-  } else if (IS_WORD ("show_license")) {
-    char *b = 
-#include "LICENSE.h"
-    ;
-    printf ("%s", b);
-  } else if (IS_WORD ("search")) {
-    GET_PEER;
-    int from = 0;
-    int to = 0;
-    int limit = 40;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty message\n");
-      RET;
-    }
-    do_msg_search (id, from, to, limit, s);
-  } else if (IS_WORD ("global_search")) {
-    int from = 0;
-    int to = 0;
-    int limit = 40;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty message\n");
-      RET;
-    }
-    do_msg_search (PEER_NOT_FOUND, from, to, limit, s);
-  } else if (IS_WORD ("mark_read")) {
-    GET_PEER;
-    do_mark_read (id);
-  } else if (IS_WORD ("visualize_key")) {
-    GET_PEER_ENCR_CHAT;
-    do_visualize_key (id);
-  } else if (IS_WORD ("create_secret_chat")) {
-    GET_PEER;    
-    do_create_secret_chat (id);
-  } else if (IS_WORD ("create_group_chat")) {
-    GET_PEER;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty chat topic\n");
-      RET;
-    }    
-    do_create_group_chat (id, s);  
-  } else if (IS_WORD ("suggested_contacts")) {
-    do_get_suggested ();
-  } else if (IS_WORD ("status_online")) {
-    do_update_status (1);
-  } else if (IS_WORD ("status_offline")) {
-    do_update_status (0);
-  } else if (IS_WORD ("contacts_search")) {
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty search query\n");
-      RET;
-    }
-    do_contacts_search (100, s);
-  } else if (IS_WORD("send_audio")) {
-    GET_PEER;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty file name\n");
-      RET;
-    }
-    do_send_photo (CODE_input_media_uploaded_audio, id, tstrndup (s, t));
-  } else if (IS_WORD("send_document")) {
-    GET_PEER;
-    int t;
-    char *s = next_token (&t);
-    if (!s) {
-      printf ("Empty file name\n");
-      RET;
-    }
-    do_send_photo (CODE_input_media_uploaded_document, id, tstrndup (s, t));
-  } else if (IS_WORD ("load_audio")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_audio) {
-      do_load_audio (&M->media.video, 1);
-    } else if (M && !M->service && M->media.type == CODE_decrypted_message_media_audio) {
-      do_load_encr_video (&M->media.encr_video, 1);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("view_audio")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_audio) {
-      do_load_audio (&M->media.video, 2);
-    } else if (M && !M->service && M->media.type == CODE_decrypted_message_media_audio) {
-      do_load_encr_video (&M->media.encr_video, 2);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("load_document_thumb")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == (int)CODE_message_media_document) {
-      do_load_document_thumb (&M->media.document, 1);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("view_document_thumb")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == (int)CODE_message_media_document) {
-      do_load_document_thumb (&M->media.document, 2);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("load_document")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_document) {
-      do_load_document (&M->media.document, 1);
-    } else if (M && !M->service && M->media.type == CODE_decrypted_message_media_document) {
-      do_load_encr_video (&M->media.encr_video, 1);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("view_document")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    struct message *M = message_get (num);
-    if (M && !M->service && M->media.type == CODE_message_media_document) {
-      do_load_document (&M->media.document, 2);
-    } else if (M && !M->service && M->media.type == CODE_decrypted_message_media_document) {
-      do_load_encr_video (&M->media.encr_video, 2);
-    } else {
-      printf ("Bad msg id\n");
-      RET;
-    }
-  } else if (IS_WORD ("set")) {
-    command = next_token (&l);
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    if (IS_WORD ("debug_verbosity")) {
-      verbosity = num;
-    } else if (IS_WORD ("log_level")) {
-      log_level = num;
-    } else if (IS_WORD ("msg_num")) {
-      msg_num_mode = num;
-    } else if (IS_WORD ("alert")) {
-      alert_sound = num;
-    }
-  } else if (IS_WORD ("chat_with_peer")) {
-    GET_PEER;
-    in_chat_mode = 1;
-    chat_mode_id = id;
-  } else if (IS_WORD ("delete_msg")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    do_delete_msg (num);
-  } else if (IS_WORD ("restore_msg")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    do_restore_msg (num);
-  } else if (IS_WORD ("delete_restore_msg")) {
-    long long num = next_token_int ();
-    if (num == NOT_FOUND) {
-      printf ("Bad msg id\n");
-      RET;
-    }
-    do_delete_msg (num);
-    do_restore_msg (num);
-  } else if (IS_WORD ("quit")) {
-    exit (0);
-  } else if (IS_WORD ("safe_quit")) {
-    safe_quit = 1;
+    assert (0);
   }
+  int i;
+  for (i = 0; i < args_num; i++) {
+    if (args[i].flags & 1) {
+      free (args[i].str);
+    }
   }
-#undef IS_WORD
-#undef RET
+  
   update_prompt ();
   in_readline = 0;
 }
 
+void interpreter (char *line UU) {
+  interpreter_ex (line, 0);
+}
+
 int readline_active;
-void rprintf (const char *format, ...) {
-  print_start ();
+/*void rprintf (const char *format, ...) {
+  mprint_start (ev);
   va_list ap;
   va_start (ap, format);
   vfprintf (stdout, format, ap);
   va_end (ap);
   print_end();
-}
+}*/
 
 int saved_point;
 char *saved_line;
 int prompt_was;
 void print_start (void) {
   if (in_readline) { return; }
+  if (readline_disabled) { return; }
   assert (!prompt_was);
   if (readline_active) {
     saved_point = rl_point;
 #ifdef READLINE_GNU
-    saved_line = talloc (rl_end + 1);
+    saved_line = malloc (rl_end + 1);
+    assert (saved_line);
     saved_line[rl_end] = 0;
     memcpy (saved_line, rl_line_buffer, rl_end);
 
@@ -1151,7 +2189,8 @@ void print_start (void) {
     rl_replace_line("", 0);
 #else
     assert (rl_end >= 0);
-    saved_line = talloc (rl_end + 1);
+    saved_line = malloc (rl_end + 1);
+    assert (saved_line);
     memcpy (saved_line, rl_line_buffer, rl_end + 1);
     rl_line_buffer[0] = 0;
     set_prompt ("");
@@ -1163,6 +2202,10 @@ void print_start (void) {
 
 void print_end (void) {
   if (in_readline) { return; }
+  if (readline_disabled) { 
+    fflush (stdout);
+    return; 
+  }
   assert (prompt_was);
   if (readline_active) {
     set_prompt (get_default_prompt ());
@@ -1173,18 +2216,18 @@ void print_end (void) {
 #endif
     rl_point = saved_point;
     rl_redisplay();
-    tfree_str (saved_line);
+    free (saved_line);
   }
   prompt_was = 0;
 }
 
-void hexdump (int *in_ptr, int *in_end) {
-  print_start ();
+/*void hexdump (int *in_ptr, int *in_end) {
+  mprint_start (ev);
   int *ptr = in_ptr;
-  while (ptr < in_end) { printf (" %08x", *(ptr ++)); }
-  printf ("\n");
-  print_end (); 
-}
+  while (ptr < in_end) { mprintf (ev, " %08x", *(ptr ++)); }
+  mprintf (ev, "\n");
+  mprint_end (ev); 
+}*/
 
 void logprintf (const char *format, ...) {
   int x = 0;
@@ -1192,12 +2235,17 @@ void logprintf (const char *format, ...) {
     x = 1;
     print_start ();
   }
-  printf (COLOR_GREY " *** ");
+  if (!disable_colors) {
+    printf (COLOR_GREY);
+  }
+  printf (" *** ");
   va_list ap;
   va_start (ap, format);
   vfprintf (stdout, format, ap);
   va_end (ap);
-  printf (COLOR_NORMAL);
+  if (!disable_colors) {
+    printf (COLOR_NORMAL);
+  }
   if (x) {
     print_end ();
   }
@@ -1207,12 +2255,14 @@ int color_stack_pos;
 const char *color_stack[10];
 
 void push_color (const char *color) {
+  if (disable_colors) { return; }
   assert (color_stack_pos < 10);
   color_stack[color_stack_pos ++] = color;
   printf ("%s", color);
 }
 
 void pop_color (void) {
+  if (disable_colors) { return; }
   assert (color_stack_pos > 0);
   color_stack_pos --;
   if (color_stack_pos >= 1) {
@@ -1222,58 +2272,78 @@ void pop_color (void) {
   }
 }
 
-void print_media (struct message_media *M) {
+void print_media (struct in_ev *ev, struct tgl_message_media *M) {
   assert (M);
   switch (M->type) {
-    case CODE_message_media_empty:
-    case CODE_decrypted_message_media_empty:
+    case tgl_message_media_none:
       return;
-    case CODE_message_media_photo:
+    case tgl_message_media_photo:
       if (M->photo.caption && strlen (M->photo.caption)) {
-        printf ("[photo %s]", M->photo.caption);
+        mprintf (ev, "[photo %s]", M->photo.caption);
       } else {
-        printf ("[photo]");
+        mprintf (ev, "[photo]");
       }
       return;
-    case CODE_message_media_video:
-      printf ("[video]");
+    case tgl_message_media_video:
+      if (M->video.mime_type) {
+        mprintf (ev, "[video: type %s]", M->video.mime_type);
+      } else {
+        mprintf (ev, "[video]");
+      }
       return;
-    case CODE_message_media_audio:
-      printf ("[audio]");
+    case tgl_message_media_audio:
+      if (M->audio.mime_type) {
+        mprintf (ev, "[audio: type %s]", M->audio.mime_type);
+      } else {
+        mprintf (ev, "[audio]");
+      }
       return;
-    case CODE_message_media_document:
+    case tgl_message_media_document:
       if (M->document.mime_type && M->document.caption) {
-        printf ("[document %s: type %s]", M->document.caption, M->document.mime_type);
+        mprintf (ev, "[document %s: type %s]", M->document.caption, M->document.mime_type);
       } else {
-        printf ("[document]");
+        mprintf (ev, "[document]");
       }
       return;
-    case CODE_decrypted_message_media_photo:
-       printf ("[photo]");
+    case tgl_message_media_photo_encr:
+      mprintf (ev, "[photo]");
       return;
-    case CODE_decrypted_message_media_video:
-      printf ("[video]");
+    case tgl_message_media_video_encr:
+      if (M->encr_video.mime_type) {
+        mprintf (ev, "[video: type %s]", M->encr_video.mime_type);
+      } else {
+        mprintf (ev, "[video]");
+      }
       return;
-    case CODE_decrypted_message_media_audio:
-      printf ("[audio]");
+    case tgl_message_media_audio_encr:
+      if (M->encr_audio.mime_type) {
+        mprintf (ev, "[audio: type %s]", M->encr_audio.mime_type);
+      } else {
+        mprintf (ev, "[audio]");
+      }
       return;
-    case CODE_decrypted_message_media_document:
-      printf ("[document]");
+    case tgl_message_media_document_encr:
+      if (M->encr_document.mime_type && M->encr_document.file_name) {
+        mprintf (ev, "[document %s: type %s]", M->encr_document.file_name, M->encr_document.mime_type);
+      } else {
+        mprintf (ev, "[document]");
+      }
       return;
-    case CODE_message_media_geo:
-      printf ("[geo] https://maps.google.com/?q=%.6lf,%.6lf", M->geo.latitude, M->geo.longitude);
+    case tgl_message_media_geo:
+      mprintf (ev, "[geo] https://maps.google.com/?q=%.6lf,%.6lf", M->geo.latitude, M->geo.longitude);
       return;
-    case CODE_message_media_contact:
-      printf ("[contact] ");
-      push_color (COLOR_RED);
-      printf ("%s %s ", M->first_name, M->last_name);
-      pop_color ();
-      printf ("%s", M->phone);
+    case tgl_message_media_contact:
+      mprintf (ev, "[contact] ");
+      mpush_color (ev, COLOR_RED);
+      mprintf (ev, "%s %s ", M->first_name, M->last_name);
+      mpop_color (ev);
+      mprintf (ev, "%s", M->phone);
       return;
-    case CODE_message_media_unsupported:
-      printf ("[unsupported]");
+    case tgl_message_media_unsupported:
+      mprintf (ev, "[unsupported]");
       return;
     default:
+      mprintf (ev, "x = %d\n", M->type);
       assert (0);
   }
 }
@@ -1281,173 +2351,192 @@ void print_media (struct message_media *M) {
 int unknown_user_list_pos;
 int unknown_user_list[1000];
 
-void print_user_name (peer_id_t id, peer_t *U) {
-  assert (get_peer_type (id) == PEER_USER);
-  push_color (COLOR_RED);
+void print_user_name (struct in_ev *ev, tgl_peer_id_t id, tgl_peer_t *U) {
+  assert (tgl_get_peer_type (id) == TGL_PEER_USER);
+  mpush_color (ev, COLOR_RED);
   if (!U) {
-    printf ("user#%d", get_peer_id (id));
+    mprintf (ev, "user#%d", tgl_get_peer_id (id));
     int i;
     int ok = 1;
     for (i = 0; i < unknown_user_list_pos; i++) {
-      if (unknown_user_list[i] == get_peer_id (id)) {
+      if (unknown_user_list[i] == tgl_get_peer_id (id)) {
         ok = 0;
         break;
       }
     }
     if (ok) {
       assert (unknown_user_list_pos < 1000);
-      unknown_user_list[unknown_user_list_pos ++] = get_peer_id (id);
+      unknown_user_list[unknown_user_list_pos ++] = tgl_get_peer_id (id);
     }
   } else {
     if (U->flags & (FLAG_USER_SELF | FLAG_USER_CONTACT)) {
-      push_color (COLOR_REDB);
+      mpush_color (ev, COLOR_REDB);
     }
     if ((U->flags & FLAG_DELETED)) {
-      printf ("deleted user#%d", get_peer_id (id));
+      mprintf (ev, "deleted user#%d", tgl_get_peer_id (id));
     } else if (!(U->flags & FLAG_CREATED)) {
-      printf ("empty user#%d", get_peer_id (id));
+      mprintf (ev, "user#%d", tgl_get_peer_id (id));
+    } else if (use_ids) {
+      mprintf (ev, "user#%d", tgl_get_peer_id (id));
     } else if (!U->user.first_name || !strlen (U->user.first_name)) {
-      printf ("%s", U->user.last_name);
+      mprintf (ev, "%s", U->user.last_name);
     } else if (!U->user.last_name || !strlen (U->user.last_name)) {
-      printf ("%s", U->user.first_name);
+      mprintf (ev, "%s", U->user.first_name);
     } else {
-      printf ("%s %s", U->user.first_name, U->user.last_name); 
+      mprintf (ev, "%s %s", U->user.first_name, U->user.last_name); 
     }
     if (U->flags & (FLAG_USER_SELF | FLAG_USER_CONTACT)) {
-      pop_color ();
+      mpop_color (ev);
     }
   }
-  pop_color ();
+  mpop_color (ev);
 }
 
-void print_chat_name (peer_id_t id, peer_t *C) {
-  assert (get_peer_type (id) == PEER_CHAT);
-  push_color (COLOR_MAGENTA);
-  if (!C) {
-    printf ("chat#%d", get_peer_id (id));
+void print_chat_name (struct in_ev *ev, tgl_peer_id_t id, tgl_peer_t *C) {
+  assert (tgl_get_peer_type (id) == TGL_PEER_CHAT);
+  mpush_color (ev, COLOR_MAGENTA);
+  if (!C || use_ids) {
+    mprintf (ev, "chat#%d", tgl_get_peer_id (id));
   } else {
-    printf ("%s", C->chat.title);
+    mprintf (ev, "%s", C->chat.title);
   }
-  pop_color ();
+  mpop_color (ev);
 }
 
-void print_encr_chat_name (peer_id_t id, peer_t *C) {
-  assert (get_peer_type (id) == PEER_ENCR_CHAT);
-  push_color (COLOR_MAGENTA);
-  if (!C) {
-    printf ("encr_chat#%d", get_peer_id (id));
+void print_encr_chat_name (struct in_ev *ev, tgl_peer_id_t id, tgl_peer_t *C) {
+  assert (tgl_get_peer_type (id) == TGL_PEER_ENCR_CHAT);
+  mpush_color (ev, COLOR_MAGENTA);
+  if (!C || use_ids) {
+    mprintf (ev, "encr_chat#%d", tgl_get_peer_id (id));
   } else {
-    printf ("%s", C->print_name);
+    mprintf (ev, "%s", C->print_name);
   }
-  pop_color ();
+  mpop_color (ev);
 }
 
-void print_encr_chat_name_full (peer_id_t id, peer_t *C) {
-  assert (get_peer_type (id) == PEER_ENCR_CHAT);
-  push_color (COLOR_MAGENTA);
-  if (!C) {
-    printf ("encr_chat#%d", get_peer_id (id));
+void print_encr_chat_name_full (struct in_ev *ev, tgl_peer_id_t id, tgl_peer_t *C) {
+  assert (tgl_get_peer_type (id) == TGL_PEER_ENCR_CHAT);
+  mpush_color (ev, COLOR_MAGENTA);
+  if (!C || use_ids) {
+    mprintf (ev, "encr_chat#%d", tgl_get_peer_id (id));
   } else {
-    printf ("%s", C->print_name);
+    mprintf (ev, "%s", C->print_name);
   }
-  pop_color ();
+  mpop_color (ev);
 }
 
 static char *monthes[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-void print_date (long t) {
+void print_date (struct in_ev *ev, long t) {
   struct tm *tm = localtime ((void *)&t);
   if (time (0) - t < 12 * 60 * 60) {
-    printf ("[%02d:%02d] ", tm->tm_hour, tm->tm_min);
+    mprintf (ev, "[%02d:%02d] ", tm->tm_hour, tm->tm_min);
   } else {
-    printf ("[%02d %s]", tm->tm_mday, monthes[tm->tm_mon]);
+    mprintf (ev, "[%02d %s]", tm->tm_mday, monthes[tm->tm_mon]);
   }
 }
 
-void print_date_full (long t) {
+void print_date_full (struct in_ev *ev, long t) {
   struct tm *tm = localtime ((void *)&t);
-  printf ("[%04d/%02d/%02d %02d:%02d:%02d]", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
+  mprintf (ev, "[%04d/%02d/%02d %02d:%02d:%02d]", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
 }
 
-int our_id;
-
-void print_service_message (struct message *M) {
+void print_service_message (struct in_ev *ev, struct tgl_message *M) {
   assert (M);
-  print_start ();
-  push_color (COLOR_GREY);
+  //print_start ();
+  mpush_color (ev, COLOR_GREY);
   
-  push_color (COLOR_MAGENTA);
+  mpush_color (ev, COLOR_MAGENTA);
   if (msg_num_mode) {
-    printf ("%lld ", M->id);
+    mprintf (ev, "%lld ", M->id);
   }
-  print_date (M->date);
-  pop_color ();
-  printf (" ");
-  if (get_peer_type (M->to_id) == PEER_CHAT) {
-    print_chat_name (M->to_id, user_chat_get (M->to_id));
+  print_date (ev, M->date);
+  mpop_color (ev);
+  mprintf (ev, " ");
+  if (tgl_get_peer_type (M->to_id) == TGL_PEER_CHAT) {
+    print_chat_name (ev, M->to_id, tgl_peer_get (M->to_id));
   } else {
-    assert (get_peer_type (M->to_id) == PEER_ENCR_CHAT);
-    print_encr_chat_name (M->to_id, user_chat_get (M->to_id));
+    assert (tgl_get_peer_type (M->to_id) == TGL_PEER_ENCR_CHAT);
+    print_encr_chat_name (ev, M->to_id, tgl_peer_get (M->to_id));
   }
-  printf (" ");
-  print_user_name (M->from_id, user_chat_get (M->from_id));
+  mprintf (ev, " ");
+  print_user_name (ev, M->from_id, tgl_peer_get (M->from_id));
  
   switch (M->action.type) {
-  case CODE_message_action_empty:
-    printf ("\n");
+  case tgl_message_action_none:
+    mprintf (ev, "\n");
     break;
-  case CODE_message_action_geo_chat_create:
-    printf ("Created geo chat\n");
+  case tgl_message_action_geo_chat_create:
+    mprintf (ev, "Created geo chat\n");
     break;
-  case CODE_message_action_geo_chat_checkin:
-    printf ("Checkin in geochat\n");
+  case tgl_message_action_geo_chat_checkin:
+    mprintf (ev, "Checkin in geochat\n");
     break;
-  case CODE_message_action_chat_create:
-    printf (" created chat %s. %d users\n", M->action.title, M->action.user_num);
+  case tgl_message_action_chat_create:
+    mprintf (ev, " created chat %s. %d users\n", M->action.title, M->action.user_num);
     break;
-  case CODE_message_action_chat_edit_title:
-    printf (" changed title to %s\n", 
+  case tgl_message_action_chat_edit_title:
+    mprintf (ev, " changed title to %s\n", 
       M->action.new_title);
     break;
-  case CODE_message_action_chat_edit_photo:
-    printf (" changed photo\n");
+  case tgl_message_action_chat_edit_photo:
+    mprintf (ev, " changed photo\n");
     break;
-  case CODE_message_action_chat_delete_photo:
-    printf (" deleted photo\n");
+  case tgl_message_action_chat_delete_photo:
+    mprintf (ev, " deleted photo\n");
     break;
-  case CODE_message_action_chat_add_user:
-    printf (" added user ");
-    print_user_name (set_peer_id (PEER_USER, M->action.user), user_chat_get (set_peer_id (PEER_USER, M->action.user)));
-    printf ("\n");
+  case tgl_message_action_chat_add_user:
+    mprintf (ev, " added user ");
+    print_user_name (ev, tgl_set_peer_id (TGL_PEER_USER, M->action.user), tgl_peer_get (tgl_set_peer_id (TGL_PEER_USER, M->action.user)));
+    mprintf (ev, "\n");
     break;
-  case CODE_message_action_chat_delete_user:
-    printf (" deleted user ");
-    print_user_name (set_peer_id (PEER_USER, M->action.user), user_chat_get (set_peer_id (PEER_USER, M->action.user)));
-    printf ("\n");
+  case tgl_message_action_chat_delete_user:
+    mprintf (ev, " deleted user ");
+    print_user_name (ev, tgl_set_peer_id (TGL_PEER_USER, M->action.user), tgl_peer_get (tgl_set_peer_id (TGL_PEER_USER, M->action.user)));
+    mprintf (ev, "\n");
     break;
-  case CODE_decrypted_message_action_set_message_t_t_l:
-    printf (" set ttl to %d seconds. Unsupported yet\n", M->action.ttl);
+  case tgl_message_action_set_message_ttl:
+    mprintf (ev, " set ttl to %d seconds. Unsupported yet\n", M->action.ttl);
+    break;
+  case tgl_message_action_read_messages:
+    mprintf (ev, " %d messages marked read\n", M->action.read_cnt);
+    break;
+  case tgl_message_action_delete_messages:
+    mprintf (ev, " %d messages deleted\n", M->action.delete_cnt);
+    break;
+  case tgl_message_action_screenshot_messages:
+    mprintf (ev, " %d messages screenshoted\n", M->action.screenshot_cnt);
+    break;
+  case tgl_message_action_flush_history:
+    mprintf (ev, " cleared history\n");
+    break;
+  case tgl_message_action_notify_layer:
+    mprintf (ev, " updated layer to %d\n", M->action.layer);
+    break;
+  case tgl_message_action_typing:
+    mprintf (ev, " is ");
+    print_typing (ev, M->action.typing);
     break;
   default:
     assert (0);
   }
-  pop_color ();
-  print_end ();
+  mpop_color (ev);
+  //print_end ();
 }
 
-peer_id_t last_from_id;
-peer_id_t last_to_id;
+tgl_peer_id_t last_from_id;
+tgl_peer_id_t last_to_id;
 
-void print_message (struct message *M) {
+void print_message (struct in_ev *ev, struct tgl_message *M) {
   assert (M);
   if (M->flags & (FLAG_MESSAGE_EMPTY | FLAG_DELETED)) {
     return;
   }
   if (!(M->flags & FLAG_CREATED)) { return; }
   if (M->service) {
-    print_service_message (M);
+    print_service_message (ev, M);
     return;
   }
-  if (!get_peer_type (M->to_id)) {
+  if (!tgl_get_peer_type (M->to_id)) {
     logprintf ("Bad msg\n");
     return;
   }
@@ -1455,116 +2544,110 @@ void print_message (struct message *M) {
   last_from_id = M->from_id;
   last_to_id = M->to_id;
 
-  print_start ();
-  if (get_peer_type (M->to_id) == PEER_USER) {
+  //print_start ();
+  if (tgl_get_peer_type (M->to_id) == TGL_PEER_USER) {
     if (M->out) {
-      push_color (COLOR_GREEN);
+      mpush_color (ev, COLOR_GREEN);
       if (msg_num_mode) {
-        printf ("%lld ", M->id);
+        mprintf (ev, "%lld ", M->id);
       }
-      print_date (M->date);
-      pop_color ();
-      printf (" ");
-      print_user_name (M->to_id, user_chat_get (M->to_id));
-      push_color (COLOR_GREEN);
+      print_date (ev, M->date);
+      mpop_color (ev);
+      mprintf (ev, " ");
+      print_user_name (ev, M->to_id, tgl_peer_get (M->to_id));
+      mpush_color (ev, COLOR_GREEN);
       if (M->unread) {
-        printf (" <<< ");
+        mprintf (ev, " <<< ");
       } else {
-        printf (" ««« ");
+        mprintf (ev, " ««« ");
       }
     } else {
-      push_color (COLOR_BLUE);
+      mpush_color (ev, COLOR_BLUE);
       if (msg_num_mode) {
-        printf ("%lld ", M->id);
+        mprintf (ev, "%lld ", M->id);
       }
-      print_date (M->date);
-      pop_color ();
-      printf (" ");
-      print_user_name (M->from_id, user_chat_get (M->from_id));
-      push_color (COLOR_BLUE);
+      print_date (ev, M->date);
+      mpop_color (ev);
+      mprintf (ev, " ");
+      print_user_name (ev, M->from_id, tgl_peer_get (M->from_id));
+      mpush_color (ev, COLOR_BLUE);
       if (M->unread) {
-        printf (" >>> ");
+        mprintf (ev, " >>> ");
       } else {
-        printf (" »»» ");
-      }
-      if (alert_sound) {
-        play_sound();
+        mprintf (ev, " »»» ");
       }
     }
-  } else if (get_peer_type (M->to_id) == PEER_ENCR_CHAT) {
-    peer_t *P = user_chat_get (M->to_id);
+  } else if (tgl_get_peer_type (M->to_id) == TGL_PEER_ENCR_CHAT) {
+    tgl_peer_t *P = tgl_peer_get (M->to_id);
     assert (P);
     if (M->out) {
-      push_color (COLOR_GREEN);
+      mpush_color (ev, COLOR_GREEN);
       if (msg_num_mode) {
-        printf ("%lld ", M->id);
+        mprintf (ev, "%lld ", M->id);
       }
-      print_date (M->date);
-      printf (" ");
-      push_color (COLOR_CYAN);
-      printf (" %s", P->print_name);
-      pop_color ();
+      print_date (ev, M->date);
+      mprintf (ev, " ");
+      mpush_color (ev, COLOR_CYAN);
+      mprintf (ev, " %s", P->print_name);
+      mpop_color (ev);
       if (M->unread) {
-        printf (" <<< ");
+        mprintf (ev, " <<< ");
       } else {
-        printf (" ««« ");
+        mprintf (ev, " ««« ");
       }
     } else {
-      push_color (COLOR_BLUE);
+      mpush_color (ev, COLOR_BLUE);
       if (msg_num_mode) {
-        printf ("%lld ", M->id);
+        mprintf (ev, "%lld ", M->id);
       }
-      print_date (M->date);
-      push_color (COLOR_CYAN);
-      printf (" %s", P->print_name);
-      pop_color ();
+      print_date (ev, M->date);
+      mpush_color (ev, COLOR_CYAN);
+      mprintf (ev, " %s", P->print_name);
+      mpop_color (ev);
       if (M->unread) {
-        printf (" >>> ");
+        mprintf (ev, " >>> ");
       } else {
-        printf (" »»» ");
-      }
-      if (alert_sound) {
-        play_sound();
+        mprintf (ev, " »»» ");
       }
     }
   } else {
-    assert (get_peer_type (M->to_id) == PEER_CHAT);
-    push_color (COLOR_MAGENTA);
+    assert (tgl_get_peer_type (M->to_id) == TGL_PEER_CHAT);
+    mpush_color (ev, COLOR_MAGENTA);
     if (msg_num_mode) {
-      printf ("%lld ", M->id);
+      mprintf (ev, "%lld ", M->id);
     }
-    print_date (M->date);
-    pop_color ();
-    printf (" ");
-    print_chat_name (M->to_id, user_chat_get (M->to_id));
-    printf (" ");
-    print_user_name (M->from_id, user_chat_get (M->from_id));
-    if ((get_peer_type (M->from_id) == PEER_USER) && (get_peer_id (M->from_id) == our_id)) {
-      push_color (COLOR_GREEN);
+    print_date (ev, M->date);
+    mpop_color (ev);
+    mprintf (ev, " ");
+    print_chat_name (ev, M->to_id, tgl_peer_get (M->to_id));
+    mprintf (ev, " ");
+    print_user_name (ev, M->from_id, tgl_peer_get (M->from_id));
+    if ((tgl_get_peer_type (M->from_id) == TGL_PEER_USER) && (tgl_get_peer_id (M->from_id) == tgl_state.our_id)) {
+      mpush_color (ev, COLOR_GREEN);
     } else {
-      push_color (COLOR_BLUE);
+      mpush_color (ev, COLOR_BLUE);
     }
     if (M->unread) {
-      printf (" >>> ");
+      mprintf (ev, " >>> ");
     } else {
-      printf (" »»» ");
+      mprintf (ev, " »»» ");
     }
   }
-  if (get_peer_type (M->fwd_from_id) == PEER_USER) {
-    printf ("[fwd from ");
-    print_user_name (M->fwd_from_id, user_chat_get (M->fwd_from_id));
-    printf ("] ");
+  if (tgl_get_peer_type (M->fwd_from_id) == TGL_PEER_USER) {
+    mprintf (ev, "[fwd from ");
+    print_user_name (ev, M->fwd_from_id, tgl_peer_get (M->fwd_from_id));
+    mprintf (ev, "] ");
   }
   if (M->message && strlen (M->message)) {
-    printf ("%s", M->message);
+    mprintf (ev, "%s", M->message);
   }
-  if (M->media.type != CODE_message_media_empty) {
-    print_media (&M->media);
+  if (M->media.type != tgl_message_media_none) {
+    print_media (ev, &M->media);
   }
-  pop_color ();
+  mpop_color (ev);
   assert (!color_stack_pos);
-  printf ("\n");
-  print_end();
+  mprintf (ev, "\n");
+  //print_end();
 }
 
 void play_sound (void) {
@@ -1572,8 +2655,9 @@ void play_sound (void) {
 }
 
 void set_interface_callbacks (void) {
+  if (readline_disabled) { return; }
   readline_active = 1;
   rl_callback_handler_install (get_default_prompt (), interpreter);
-  rl_attempted_completion_function = (void *) complete_text;
-  rl_completion_entry_function = (void *)complete_none;
+  //rl_attempted_completion_function = (void *) complete_text;
+  rl_completion_entry_function = command_generator;
 }

@@ -4,10 +4,11 @@
 		"libconfig",
 		"libexecinfo",
 		"lua52",
-		"libevent2"
+		"libevent2",
+		"gmake"
 	],
 	"build": [
 		"./configure",
-		"make"
+		"gmake"
 	]
 }

@@ -1,0 +1,12 @@
+{
+	"version": 1,
+	"packages": [
+		"libconfig",
+		"libexecinfo",
+		"lua52"
+	],
+	"build": [
+		"./configure",
+		"make"
+	]
+}

@@ -3,7 +3,8 @@
 	"packages": [
 		"libconfig",
 		"libexecinfo",
-		"lua52"
+		"lua52",
+		"libevent2"
 	],
 	"build": [
 		"./configure",
